@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+python-multipart
+aiohttp
+requests
+PySocks
+pydantic
+patchright
+python-dotenv
+pillow
+pycryptodome
+cryptography
+# 豆包渠道：渲染「豆包 App 扫码」二维码。缺失时自动回退服务端下发的官方抖音码，不致命。
+qrcode

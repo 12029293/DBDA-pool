@@ -1,0 +1,69 @@
+# --- secrets / local config ---
+.env.local
+cookies.txt
+*.log
+
+# --- account state (contains real login sessions + emails) ---
+accounts/
+
+# --- databases (API keys, task history, account metadata) ---
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# --- generated media ---
+downloads/
+refs/
+
+# --- probe / debug artifacts (contain live session snippets) ---
+/*.html
+/*.png
+/*.jpg
+/*.json
+/*.txt
+!requirements.txt
+!README.md
+!deploy-constraints.txt
+!deploy-extra-requirements.txt
+
+# --- one-off debug script (contains a signed CDN url) ---
+dl_now.py
+
+# --- python ---
+__pycache__/
+.venv/
+*.pyc
+
+# --- deployment secrets / local backups (added locally) ---
+dola.env
+*.bak-*
+
+# --- 服务器专属文件（服务器目录本身是个 git 工作副本，这些不进仓库）---
+# run.sh 里是真实的 DOLA_PUBLIC_BASE 与 DOLA_API_KEYS；仓库里只有 deploy/run.sh.example
+/run.sh
+/service.sh
+/healthcheck.sh
+/DEPLOY-BT.md
+/.pytest_cache/
+# cred_store.py 的加密密钥（用来解密 accounts/<号>/ 里的 cookie）；泄漏 = 号全丢
+/cred.key
+*.key
+
+# --- 真实会话 / 账号数据（即使私有仓库也不收录，泄漏即可直接接管账号）---
+protocol/.dola_*.json
+doubao_accounts/
+registered_ck/
+doubao_uploads/
+
+# --- 本地备份目录与临时诊断脚本（不属于项目本体）---
+/backup-*/
+_diag_*.py
+_verify_*
+_check_*.js
+_smoke_*.py
+_test_*.py
+_restart_pool.py
+_run_take_poll.py
+protocol/js/_req*.json
+/kill

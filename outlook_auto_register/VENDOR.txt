@@ -1,0 +1,1 @@
+source: https://github.com/lxf746/outlook-auto-register
