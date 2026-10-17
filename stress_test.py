@@ -10,6 +10,7 @@ N 个 headed Chromium（与 add_account / browser_pool 相同的启动参数）�
 仅在 Linux + Xvfb 环境有意义（服务已由 xvfb-run 启动）。
 """
 import asyncio
+import os
 import shutil
 import subprocess
 import tempfile
@@ -20,6 +21,14 @@ from pathlib import Path
 from patchright.async_api import async_playwright
 
 from browser import LAUNCH_ARGS, proxy_kwargs_for
+
+
+# hint855：外部进程（ffmpeg/ffprobe/tasklist 等）不得弹控制台窗。
+# 注意 CREATE_NO_WINDOW 在父进程已有控制台时会被忽略，必须叠加 DETACHED_PROCESS。
+_NO_WIN = 0
+if os.name == "nt":
+    _NO_WIN = (getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+               | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
 
 # 默认每级保持浏览器打开的时间（秒）
 HOLD_SECONDS = 5.0
@@ -50,6 +59,7 @@ def _ps_rows() -> list[tuple[int, int, str]]:
         out = subprocess.run(
             ["ps", "-eo", "pid=,rss=,args="],
             capture_output=True, text=True, timeout=3,
+            creationflags=_NO_WIN,   # hint855
         ).stdout
     except Exception:
         return []

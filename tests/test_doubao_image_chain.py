@@ -51,6 +51,7 @@ CK = ("sessionid=" + "e" * 32 + "; sessionid_ss=" + "e" * 32
 
 STORE_URI = "tos-cn-v-abc123/ref-image-0001"
 TOS_AUTH = "upload-auth-token-xyz"
+SESSION_KEY = "session-key-fixture-base64=="
 MP4 = b"\x00\x00\x00\x18ftypisom" + b"payload" * 64
 
 
@@ -99,13 +100,27 @@ def build_app(fx: Fixture) -> web.Application:
         })
 
     async def apply_upload(request):
-        fx.rec("ApplyImageUpload", query=dict(request.query),
+        fx.rec("ApplyImageUpload", path=request.path,
+               query=dict(request.query),
                auth=request.headers.get("Authorization", ""),
                xdate=request.headers.get("X-Amz-Date", ""))
         return web.json_response({"Result": {"UploadAddress": {
-            "StoreInfos": [{"StoreUri": STORE_URI, "Auth": TOS_AUTH}],
+            "StoreInfos": [{"StoreUri": STORE_URI, "Auth": TOS_AUTH,
+                            "UploadID": "up-1"}],
             "UploadHosts": [f"127.0.0.1:{request.url.port}"],
+            "SessionKey": SESSION_KEY,
         }}})
+
+    async def commit_upload(request):
+        body = await request.json()
+        fx.rec("CommitImageUpload", path=request.path,
+               query=dict(request.query), body=body,
+               auth=request.headers.get("Authorization", ""),
+               payload_hash=request.headers.get("X-Amz-Content-Sha256", ""),
+               ctype=request.headers.get("Content-Type", ""))
+        return web.json_response({"Result": {"Results": [{
+            "Uri": STORE_URI, "UriStatus": 2000,
+        }]}})
 
     async def tos_put(request):
         data = await request.read()
@@ -149,7 +164,9 @@ def build_app(fx: Fixture) -> web.Application:
 
     app.router.add_post("/alice/user/get_account_info", account_info)
     app.router.add_post("/alice/resource/prepare_upload", prepare_upload)
-    app.router.add_get("/", apply_upload)
+    # ApplyImageUpload 走 GET /top/v1（2026-10-13 端点对齐网页版反代）
+    app.router.add_get("/top/v1", apply_upload)
+    app.router.add_post("/top/v1", commit_upload)
     app.router.add_put("/{tail:.*}", tos_put)
     app.router.add_post("/chat/completion", completion)
     app.router.add_post("/im/chain/single", chain_single)
@@ -267,8 +284,10 @@ def test_reference_image_upload_then_generate_full_chain(tmp_path, monkeypatch):
             assert p1["query"]["device_platform"] == "web"
 
             # ③ ApplyImageUpload 带 AWS4 签名与必要参数
+            # ★ 2026-10-13：端点改为豆包域反代 /top/v1（HAR 实测对齐网页版）
             p2 = fx.get("ApplyImageUpload")
             assert p2 is not None, fx.calls
+            assert p2["path"] == "/top/v1", p2["path"]
             assert p2["query"]["Action"] == "ApplyImageUpload"
             assert p2["query"]["ServiceId"] == "svc-1"
             assert p2["query"]["UploadNum"] == "1"
@@ -283,6 +302,22 @@ def test_reference_image_upload_then_generate_full_chain(tmp_path, monkeypatch):
             assert p3["data"] == ref.read_bytes()
             assert p3["auth"] == TOS_AUTH
             assert len(p3["crc32"]) == 8, p3["crc32"]
+
+            # ④.5 ★ 2026-10-13 新增：CommitImageUpload 第 4 跳
+            #   POST /top/v1?Action=CommitImageUpload + {"SessionKey": ...}
+            #   且签名带 x-amz-content-sha256（POST+body 签名所需）
+            pc = fx.get("CommitImageUpload")
+            assert pc is not None, fx.calls
+            assert pc["path"] == "/top/v1", pc["path"]
+            assert pc["query"]["Action"] == "CommitImageUpload"
+            assert pc["query"]["ServiceId"] == "svc-1"
+            assert pc["body"] == {"SessionKey": SESSION_KEY}, pc["body"]
+            assert "AWS4-HMAC-SHA256" in pc["auth"], pc["auth"][:60]
+            assert len(pc["payload_hash"]) == 64, pc["payload_hash"]
+            assert "json" in pc["ctype"], pc["ctype"]
+            # Commit 必须发生在 PUT 之后
+            names = [c["name"] for c in fx.calls]
+            assert names.index("CommitImageUpload") > names.index("tos_put"), names
 
             # ⑤ /chat/completion 的 content_block 结构
             p4 = fx.get("completion")
@@ -300,9 +335,14 @@ def test_reference_image_upload_then_generate_full_chain(tmp_path, monkeypatch):
             assert p4["body"]["chat_ability"]["ability_type"] == 17
             ap = json.loads(p4["body"]["chat_ability"]["ability_param"])
             assert ap == {"ratio": "16:9", "model": "seedance_v2.0", "duration": 5}, ap
-            assert blocks[1]["content"]["text_block"]["text"].startswith("生成影片：")
+            # ★ 2026-10-13：文本格式对齐网页版——附件引用前缀 + 模型/比例/时长
+            txt = blocks[1]["content"]["text_block"]["text"]
+            assert txt.startswith("[ref.png](attachment://" + STORE_URI + "?type=1) "), txt[:120]
+            assert "生成影片：" in txt
+            assert "使用Seedance 2.0生成" in txt, txt[:120]
+            assert "16:9" in txt and "5秒" in txt, txt[:120]
 
-            # ⑥ 轮询：必须是 uplink_body 包装 + im 版头
+            # ⑤.5 轮询：必须是 uplink_body 包装 + im 版头
             p5 = fx.get("chain_single")
             assert p5 is not None, fx.calls
             assert p5["ctype"] == "application/json; encoding=utf-8", p5["ctype"]

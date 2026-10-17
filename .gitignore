@@ -67,3 +67,59 @@ _restart_pool.py
 _run_take_poll.py
 protocol/js/_req*.json
 /kill
+
+# ============================================================
+# 上传 GitHub 前的强制排除项（2026-10-16 新增）
+# 以下任一目录进入版本库 = 账号/cookie 直接泄漏，私有仓库也不行
+# ============================================================
+
+# 账号数据：acc/ 与 accounts/ 是指向项目外目录的 Junction（真实登录态）
+/acc/
+/accounts/
+/doubao_accounts/
+/registered_ck/
+/doubao_uploads/
+/_gacc_profiles/
+
+# cookie 池 / 探针会话文件（每个号 3 份 cookie，共 1386 个）
+/pool/
+/pool_*.json
+/probe_*.json
+*.cookie.txt
+*.netscape.txt
+
+# 生成媒体与二进制产物（体积过大，不进仓库）
+/assets/
+/out/
+/thumbs/
+/downloads/
+/refs/
+
+# 根目录调试/探测杂物
+/_ui_*.png
+/_junit*.xml
+/_pytest*.txt
+/_t*.txt
+/_t*.log
+/_t*.out.log
+/_t*.err.log
+/_diag_*.log
+/_files50.txt
+/_order50.txt
+/_snapshot.py
+/_safe_sqlite.py
+/_diff_backup.py
+/_e2e_*.py
+/_ui_e2e.py
+/STOP
+/kill
+/tasks.db*
+/tasks.txt
+/tasks.txt.bak_*
+/tasks.meta.jsonl*
+/assets.db
+/pool_usage.db*
+
+# 日志
+/logs/
+*.log

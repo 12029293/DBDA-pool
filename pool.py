@@ -1,4 +1,4 @@
-"""账号池选号引擎（移植自 api-pool 的 server.pool.AccountPool）。
+﻿"""账号池选号引擎（移植自 api-pool 的 server.pool.AccountPool）。
 
 纯状态机 + 配额 + 路由 + 代理隔离，不依赖浏览器/HTTP 库，可独立单测。
 浏览器 worker（browser_pool.BrowserPool）用它做选号，保留自己的出片逻辑。
@@ -10,6 +10,13 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+try:
+    import _safe_sqlite  # thread-safe sqlite3 wrapper (fixes SQLITE_MISUSE)
+except Exception:  # pragma: no cover
+    import os as _os, sys as _sys
+    _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+    import _safe_sqlite
+
 import time
 from dataclasses import dataclass, field
 from datetime import date
@@ -91,7 +98,7 @@ class DailyUsage:
     db_path: Path
 
     def __post_init__(self):
-        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        self._conn = _safe_sqlite.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")

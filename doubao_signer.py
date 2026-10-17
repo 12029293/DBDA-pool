@@ -55,14 +55,19 @@ class _DoubaoPersistentSigner(PersistentSigner):
         env = os.environ.copy()
         env["DOUBAO_SIGNER_DAEMON"] = "1"
         env["DOLA_SIGNER_DAEMON"] = "1"
+        env["DOLA_SIGNER_PARENT_PID"] = str(os.getpid())   # 孤儿自尽（hint855）
         self._queue = queue.Queue()
         self._stderr_tail.clear()
         self._generation += 1
+        # 与 pure_signer 同理：抑制每个 node 长驻签名进程的控制台弹窗。
+        # 仅 CREATE_NO_WINDOW 在父进程已有控制台时会被忽略，必须叠加 DETACHED_PROCESS。
+        _creationflags = getattr(pure_signer, "spawn_flags", lambda: 0)()
         self._proc = subprocess.Popen(
             [resolve_node(), str(self.script), "--daemon"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             cwd=str(self.script.parent), text=True, encoding="utf-8",
             errors="replace", bufsize=1, env=env,
+            creationflags=_creationflags,
         )
         threading.Thread(target=self._read_stdout,
                          args=(self._proc, self._queue, self._generation),

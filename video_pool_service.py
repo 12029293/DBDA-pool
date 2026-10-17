@@ -173,7 +173,12 @@ class VideoPoolManager:
                 subprocess.run(
                     [sys.executable, "-u", str(REGISTER_SCRIPT)],
                     cwd=str(RUN), env=env, stdout=f, stderr=subprocess.STDOUT,
-                    timeout=REGISTER_TIMEOUT)
+                    timeout=REGISTER_TIMEOUT,
+                    # hint855：注册子进程（python）不得弹控制台窗
+                    creationflags=(
+                        (getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+                         | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
+                        if os.name == "nt" else 0))
         except subprocess.TimeoutExpired:
             # 脚本可能已完成全部工作只是清理挂起：照常解析日志，出结果不算失败
             self.log("warn", "注册子进程超时 %ds，尝试按日志判定结果" % REGISTER_TIMEOUT)

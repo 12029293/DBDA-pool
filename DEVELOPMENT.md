@@ -188,6 +188,9 @@ F:\ai\视频逆向\dola-pool\
 - 跑脚本前 `set PYTHONIOENCODING=utf-8` 看中文日志。- 跑脚本前 `set PYTHONIOENCODING=utf-8` 看中文日志。
 - 加新号：`add_account.py <名> "email----pass----totp"` 或面板「账号管理 → 添加账号」；加号失败会在 `/api/admin/jobs` 留 `failed` + 错误。
 - 面板出问题先看浏览器控制台；前后端都由 `server.py` 启动，UI 是纯静态单文件 `web/index.html`，改完刷新即可、无需重启（改 Python 后端才需重启）。
+- **端口约定：本地调试只用 `8019`，不得新开端口**（用户 2026-10-16 明确要求）。起服务：
+  `$env:PYTHONIOENCODING='utf-8'; .venv\Scripts\python.exe -m uvicorn server:app --host 127.0.0.1 --port 8019`
+  用完即停（`Get-NetTCPConnection -LocalPort 8019` 找 pid 再 `Stop-Process`），不要把 8017/8018/8020/8021 之类的临时端口留在机器上。
 
 ---
 

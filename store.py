@@ -6,6 +6,13 @@ import json
 import os
 import secrets
 import sqlite3
+try:
+    import _safe_sqlite  # thread-safe sqlite3 wrapper (fixes SQLITE_MISUSE)
+except Exception:  # pragma: no cover
+    import os as _os, sys as _sys
+    _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+    import _safe_sqlite
+
 import threading
 import time
 
@@ -28,7 +35,7 @@ class PendingTaskLimitExceeded(RuntimeError):
 class TaskStore:
     def __init__(self, db_path: str):
         self.db_path = db_path
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn = _safe_sqlite.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA busy_timeout=5000")
         # WAL + synchronous=NORMAL：本机 fsync 实测 ~40ms/次（delete+FULL 模式），
@@ -214,8 +221,14 @@ class TaskStore:
         concurrency_limit=0,
         max_pending=0,
         channel="dola",
+        created_at=None,
     ):
         now = time.time()
+        # ★ created_at 允许显式指定。引擎成片同步（_sync_engine_tasks_to_db）必须
+        #   用它落**真实出片时刻**；否则只能填"入库这一刻"，一次同步写进来的十几条
+        #   成片 created_at 全等（实测 11 条都是 1792167354.157）→ 任务中心
+        #   「创建时间」整列显示同一个 00:15，与真实出片时间（14:26~23:50）脱钩。
+        created = float(created_at) if created_at else now
         clamped = self._clamp_fields({
             "model": model,
             "prompt": prompt,
@@ -258,7 +271,7 @@ class TaskStore:
                     clamped["ratio"],
                     duration,
                     account,
-                    now,
+                    created,
                     now,
                     clamped["reference_images"],
                     api_key_hash,

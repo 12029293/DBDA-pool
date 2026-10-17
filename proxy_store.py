@@ -21,6 +21,13 @@ import re
 import secrets
 import socket
 import sqlite3
+try:
+    import _safe_sqlite  # thread-safe sqlite3 wrapper (fixes SQLITE_MISUSE)
+except Exception:  # pragma: no cover
+    import os as _os, sys as _sys
+    _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+    import _safe_sqlite
+
 import ssl
 import struct
 import time
@@ -64,7 +71,7 @@ _ready_paths: set[str] = set()
 
 
 def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False, timeout=15)
+    conn = _safe_sqlite.connect(str(DB_PATH), check_same_thread=False, timeout=15)
     conn.row_factory = sqlite3.Row
     # WAL + synchronous=NORMAL：本机 fsync ~40ms/次，代理探测/节点刷新高频写会拖慢面板
     conn.execute("PRAGMA journal_mode=WAL")
@@ -1095,11 +1102,29 @@ def _is_host_port(text: str) -> bool:
     return len(parts) == 2 and parts[1].strip().isdigit()
 
 
+def iprocket_disabled() -> bool:
+    """IPRocket 总开关是否处于停用状态（DOLA_IPROCKET_ENABLED=0）。"""
+    return os.environ.get("DOLA_IPROCKET_ENABLED", "1").strip().lower() in (
+        "0", "false", "no", "off")
+
+
+def _is_iprocket_url(url: str) -> bool:
+    """只认 IPRocket 自己的接口域名 —— 总开关只停 IPRocket，不影响别的代理源。"""
+    try:
+        host = (urlsplit(url).hostname or "").lower()
+    except Exception:  # noqa: BLE001
+        return "iprocket" in (url or "").lower()
+    return host == "iprocket.io" or host.endswith(".iprocket.io")
+
+
 def fetch_extract_nodes(proxy_id: str, info: dict | None = None) -> dict:
     """调用提取接口，把新节点写进 proxy_nodes（旧节点保留，过期自然淘汰）。
 
     注意：GenerateLink 类接口通常**按调用次数计费/配额**，所以只在
     需要补节点、且距上次提取超过 extract_interval 时才调用。
+
+    DOLA_IPROCKET_ENABLED=0 时，**指向 IPRocket 的提取链接**直接拒绝（不碰网络）；
+    其它代理源的提取链接不受影响（见 three_segment_exit.py 顶部说明）。
     """
     import requests
 
@@ -1109,6 +1134,10 @@ def fetch_extract_nodes(proxy_id: str, info: dict | None = None) -> dict:
     url = (info.get("extract_url") or "").strip()
     if not url:
         return {"ok": False, "added": 0, "error": "该代理未配置提取链接"}
+    # IPRocket 停用：只拦 IPRocket 的接口（按次计费，失败重试会烧额度）
+    if iprocket_disabled() and _is_iprocket_url(url):
+        return {"ok": False, "added": 0,
+                "error": "IPRocket 已被 DOLA_IPROCKET_ENABLED=0 停用"}
     try:
         resp = requests.get(url, timeout=_extract_timeout())
         resp.raise_for_status()

@@ -17,6 +17,7 @@
 """
 import asyncio
 import json
+import os
 import shutil
 import subprocess
 import time
@@ -247,7 +248,12 @@ def browser_backend_available() -> tuple[bool, str]:
         return False, "patchright 驱动不存在（未安装或包被裁剪）"
     try:
         proc = subprocess.run(
-            [str(node), "--version"], capture_output=True, text=True, timeout=30
+            [str(node), "--version"], capture_output=True, text=True, timeout=30,
+            # hint855：node 子进程不得弹控制台窗（父进程有控制台时 CREATE_NO_WINDOW 会被忽略）
+            creationflags=(
+                (getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+                 | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
+                if os.name == "nt" else 0),
         )
     except Exception as exc:  # noqa: BLE001
         return False, f"驱动无法执行: {type(exc).__name__}: {exc}"[:200]

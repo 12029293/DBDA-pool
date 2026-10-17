@@ -49,7 +49,7 @@ IMAGEX_REGION = "us-east-1"
 IMAGEX_SERVICE = "imagex"
 NOWATERMARK_API_ENDPOINT = "http://47.104.150.143:8765/tools/dola/"
 NOWATERMARK_API_TIMEOUT = 60
-DEFAULT_POLL_INTERVAL = 30
+DEFAULT_POLL_INTERVAL = int(os.getenv("DOLA_PURE_POLL_INTERVAL", "120") or 120)
 DEFAULT_DOWNLOAD_DIR = SCRIPT_DOWNLOAD_DIR = Path(__file__).resolve().parent / "downloads"
 DEFAULT_AUDIO_REFERENCE_PROMPT = "记住这个音频，他是人物张三的参考音色，后续生成视频需要用到；"
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -64,6 +64,21 @@ _SIGNER_CANDIDATES = (
 )
 SIGNER = next((path for path in _SIGNER_CANDIDATES if path.exists()), _SIGNER_CANDIDATES[0])
 _SIGN_URL_IMPL = None
+
+# hint855：拉起 node 签名子进程必须 DETACHED_PROCESS|CREATE_NO_WINDOW，否则每次调用
+# 都会弹出一个 node 控制台黑窗（CREATE_NO_WINDOW 在父进程已有控制台时会被忽略）。
+_NO_WINDOW_FLAGS = 0
+if os.name == "nt":
+    _NO_WINDOW_FLAGS = (getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+                        | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
+
+
+def _env_flag(name: str, default: bool = True) -> bool:
+    """读布尔环境变量；空值/缺省用 default（协议层不 import config，保持 vendored）。"""
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    return str(raw).strip().lower() not in ("0", "false", "no", "off")
 
 
 def _node_exe() -> str:
@@ -148,6 +163,7 @@ def convert_audio_to_mp3(path: Path) -> Path:
             capture_output=True,
             text=True,
             timeout=120,
+            creationflags=_NO_WINDOW_FLAGS,   # hint855：波形转换 ffmpeg 不弹控制台
         )
     except Exception:
         try:
@@ -399,10 +415,19 @@ def send_with_cookie_header(
 
 
 def warmup_login_session(session: requests.Session, headers: dict[str, str] | None = None, timeout: int = 30) -> requests.Response:
-    """Hit create-image so ttwid lands, then fold it into the login Cookie header."""
+    """Hit create-image so ttwid lands, then fold it into the login Cookie header.
+
+    【IPRocket 流量治理 · 2026-10-17】默认改用 HEAD：
+    这个请求唯一的作用是让上游种下 ttwid / hook_slardar_session_id，而 SPA HTML
+    压缩后就有 77 KB（解压 252 KB）。HEAD 同样会收到 Set-Cookie，线上字节为 0。
+    实测（_diag_headwarm.py）：HEAD 与 GET 之后 x-tt-agw-login 都是 '1'，
+    get_web_anon_id / launch / im/chain 查询全部正常 —— 两者等价。
+    设 DOLA_WARMUP_HEAD=0 可回退成 GET 全量。
+    """
+    use_head = _env_flag("DOLA_WARMUP_HEAD", True)
     resp = send_with_cookie_header(
         session,
-        "GET",
+        "HEAD" if use_head else "GET",
         f"{BASE}/chat/create-image",
         headers=dict(headers or headers_base()),
         timeout=timeout,
@@ -511,6 +536,7 @@ def sign_url(url: str, *, method: str = "POST", headers: dict[str, str] | None =
         cwd=str(SCRIPT_DIR),
         encoding="utf-8",
         errors="replace",
+        creationflags=_NO_WINDOW_FLAGS,   # 一次性签名 node 不得弹控制台窗（hint855）
     )
     if proc.returncode != 0:
         raise DolaError(f"BDMS signer failed: {proc.stderr[:500]} {proc.stdout[:500]}")

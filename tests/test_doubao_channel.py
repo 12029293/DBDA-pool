@@ -635,6 +635,55 @@ def test_pool_generate_fails_on_empty_pool(pool):
         asyncio.run(pool.generate_video("x"))
 
 
+def test_pool_generate_does_not_spin_when_no_schedulable_account(pool, monkeypatch):
+    """★ 2026-10-13 回归：池里有号但**全部不可调度**时必须立刻失败。
+
+    原实现在「候选为空」时只判断 `all(n in tried)`，当池里一个可调度号都没有
+    （全部冷却/额度用尽/调度关闭/新号预热）时 tried 仍为空 → 该判断恒为 False →
+    无限 `sleep(2)` 直到 deadline（实测把整套测试卡死 240s+）。
+    修复后：`_select()` 返回空即判失败，不再空等。
+    """
+    pool.add("db001", CK)
+    # 造一个「有号但不可调度」的状态：调度关闭
+    pool.store.patch_meta("db001", login_ok=True, scheduling=False)
+    assert pool._select() == []          # 前置：确实选不出号
+
+    calls = {"n": 0}
+    real_sleep = asyncio.sleep
+
+    async def counting_sleep(sec):
+        calls["n"] += 1
+        if calls["n"] > 3:               # 死循环会远超这个数
+            raise AssertionError("generate_video 在无可调度号时空转（回归）")
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", counting_sleep)
+    t0 = time.time()
+    with pytest.raises(RuntimeError):
+        asyncio.run(pool.generate_video("x", deadline=time.time() + 30))
+    assert time.time() - t0 < 5, "应立即失败而不是等到 deadline"
+    assert calls["n"] <= 3, f"不应反复 sleep 空转（实际 {calls['n']} 次）"
+
+
+def test_pool_warmup_skips_account_when_enabled(pool, monkeypatch):
+    """预热开启时新号不参与自动调度；关闭（默认）时不受影响。"""
+    pool.add("db001", CK)
+    pool.store.patch_meta("db001", login_ok=True)
+    assert pool._select() == ["db001"]            # 默认关闭 → 可调度
+
+    monkeypatch.setattr(doubao_pool, "WARMUP_SECONDS", 1800)
+    # 刚入池的号（created_at 即现在）应被预热挡掉
+    assert pool._select() == []
+    acc = next(a for a in pool.summary()["accounts"] if a["name"] == "db001")
+    assert acc["group"] == doubao_pool.GROUP_WARMUP
+    assert acc["warmup_left"] > 0
+    # 手动测试生成**不受**预热限制（用户明确意图）
+    pool.store.patch_meta("db001", login_ok=True)
+
+    monkeypatch.setattr(doubao_pool, "WARMUP_SECONDS", 0)
+    assert pool._select() == ["db001"]
+
+
 def test_pool_generate_video_success_charges_quota(pool, monkeypatch):
     pool.add("db001", CK)
     pool.store.patch_meta("db001", login_ok=True)

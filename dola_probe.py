@@ -38,11 +38,20 @@ import re
 import socket
 import ssl
 import struct
+import subprocess
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+
+# hint855：外部进程（ffmpeg/ffprobe/tasklist 等）不得弹控制台窗。
+# 注意 CREATE_NO_WINDOW 在父进程已有控制台时会被忽略，必须叠加 DETACHED_PROCESS。
+_NO_WIN = 0
+if os.name == "nt":
+    _NO_WIN = (getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+               | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
 
 # ---------------------------------------------------------------- 控制台中文
 try:
@@ -626,7 +635,8 @@ def _run(cmd):
     """执行系统命令；Windows 中文环境 tasklist/netstat 输出是 GBK，需容错解码"""
     import subprocess
     try:
-        p = subprocess.run(cmd, capture_output=True, timeout=25)
+        p = subprocess.run(cmd, capture_output=True, timeout=25,
+                           creationflags=_NO_WIN)   # hint855：不弹控制台
     except Exception:
         return ""
     raw = p.stdout or b""

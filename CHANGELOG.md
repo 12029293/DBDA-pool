@@ -1,5 +1,185 @@
 # 更新日志
 
+## 未发布 — 「运行状态」每次打开都要从零统计
+
+**问题（用户 2026-10-17 实测反馈）**：面板「运行状态」页每次打开（以及每 5 秒
+自动刷新）都要从头统计一遍，明显卡顿。
+
+**根因**：一次 `manager.status()` 会顺着调用链起 **4 个 `wmic` 子进程**
+（实测合计 0.8~1.0s），同一份进程表被反复枚举：
+
+| 调用点 | wmic 查询 |
+|---|---|
+| `_pid_file_running()` → `_pid_is_our_engine()` → `_scan_engine_pids()` | `name='python.exe' get ProcessId,CommandLine` |
+| 同上，`_pid_file_running()` 兜底分支再来一次 | 同一份查询重复第 2 次 |
+| `_run_started_tstr()` → `_proc_elapsed()` | `ProcessId=N get CreationDate` |
+| `status()` 取 `elapsed` → `_proc_elapsed()` | 同一份查询重复第 2 次 |
+
+前端 `setInterval(engRefresh, 5000)`（`web/index.html:4063`），所以这个代价
+每 5 秒付一次。注：**计数本身是稳定的、没有被重置**（实测连续 4 次调用
+windows=22 / accepted=16 / harvest_ok=12 完全一致），问题纯粹是耗时。
+
+**修复**：`_scan_engine_pids` / `_proc_elapsed` 按 PID 做 TTL 缓存。
+
+- **`_proc_elapsed` 缓存的是「进程创建时刻」而不是「已运行秒数」**：返回值仍按
+  `当前时间 - 创建时刻` 实时算，所以「已运行 X 分钟」不会停住不走
+  （实测 908s → 934s 连续递增）。
+- **TTL = 20s，必须大于前端 5 秒刷新间隔**：TTL 设 3s 时每次刷新都恰好过期，
+  缓存形同虚设（实测仍是 0.45s/次）。有测试钉住这个不变量。
+- **安全路径一律 `fresh=True` 绕过缓存**，判错会拉起第二个引擎（fact 629 反模式：
+  两个嗅探器互抢窗口相位）：`start()` 判重、`stop()`、`queue_clear()`、
+  `queue_reload()`、`submit_tasks()`。展示路径 `status()` / `_run_started_tstr()`
+  才吃缓存。
+- 存活判断不受 TTL 影响：`alive_beat` 走的是 `submit.jsonl` /
+  `engine_console.log` / `ledger.jsonl` 的文件新鲜度（阈值 90s），实时且廉价。
+
+**效果**：`status()` 从 0.79s（每次 4 个 wmic）降到 **0.06s**（命中缓存，0 个
+wmic）；每 20 秒才重建一次缓存（约 0.42s）。前端 5 秒刷新节奏下，实际
+4/5 次刷新几乎无开销。
+
+**测试**：新增 `tests/test_engine_status_cache.py`（5 例）：缓存命中不再起 wmic、
+`fresh=True` 真的绕过缓存、缓存的是创建时刻（时长继续增长）、TTL 过期重新枚举、
+TTL 必须大于前端刷新间隔。
+
+## 未发布 — 任务中心的「时间 / 视频 / 提示词」错乱
+
+**问题（用户 2026-10-17 实测反馈）**：任务中心「时间跟视频都对不上，跟任务全都是错乱的」。
+逐条核对 `tasks.db` / `out/ledger.jsonl` / `out/queue_state.json` 与面板 8019 的原始
+返回后，确认是**四层**独立缺陷叠加，全部是展示层与写入层的问题（引擎出片本身正常）：
+
+1. **创建时间 = 入库时间**：`_sync_engine_tasks_to_db` 走 `store.create()` 的默认
+   `time.time()`，一次同步写进来的 11 条成片 `created_at` **完全相等**
+   （实测 `1792167354.157` = 00:15:54）→ 整列显示同一个 `00:15`，与真实出片时刻
+   （14:26~23:50）脱钩。
+2. **同一部片两个提示词**：`_engine_video_rows` 有条 `prompt_by_tid["t%03d"%n]`
+   兜底，拿 **tasks.txt 当前第 n 行**给"台账没记 prompt"的老成片补提示词。tid 每轮
+   重排复用，队列换批后行号与 tid 完全脱钩 —— 实测 `t002_38418427.mp4` 在任务中心
+   是空、在视频库却显示"汉服美女在赛博朋克的街道跑酷"，而它真实是"无人机缓缓飞过
+   东京雨夜街道…"。
+3. **队列行的时长/等待时长是编的**：队列行 `duration` 缺失时前端 `t.duration||10`
+   兜底显示 **10 秒**（其余行 30 秒，同批任务显示两个时长）；「已等 X 分」的
+   `created_at` 取的是**快照 generated_at**（引擎每 3 秒重写）或 `tasks.txt` 的
+   mtime —— 显示的是"文件多久没被写过"，与排队时长无关，且随刷新跳变。
+4. **提示词已被 ASCII 化成问号**（数据已损坏，非显示问题）：`out/ledger.jsonl` 里
+   t004/t005 的 harvest 与 submit_retry 记录 `"prompt": "???????????????"`，
+   上游回显 `生成视频：???????????????，21:9` 在引擎日志里出现 **29** 次
+   （`???????:?????????` 25 次）。扫全仓 jsonl/json/txt/log 仅此三处带问号，
+   原始文案无副本可还原。
+
+**修复**：
+
+- **入库带真实出片时刻**：`store.create(..., created_at=)`；同步时用台账 harvest 的
+  落盘时刻（退化到 mp4 mtime）写入。新增 `_heal_engine_created_at` 在每次同步时
+  幂等修复存量行，无需删库重灌；与 `finished_at` 相符（已是正确值）或其上已由面板
+  链路写入的行不动。
+- **不再按行号猜提示词**：删掉 `prompt_by_tid` 兜底。台账认领不出提示词就**留空**，
+  前端显示 `—`。口径与仓库既有约定一致（`_engine_video_rows` 原注释：
+  "台账缺记录时不造假，如实留空"）。
+- **时长/比例/模型只认台账**：不再取全局 `engine params`（那是"当前引擎参数"，
+  改设置会让历史成片集体变值）；队列行没有时长就显示 `—`，不再兜底 10 秒。
+- **等待/运行时长诚实留空**：服务端给队列行打 `created_at_trusted=False`，前端据此
+  不显示「已等 X 分 / 已 X 分」，创建时间列显示 `—`。
+- **提示词损坏可见化**：本次不伪造修复（原文不可恢复）。损坏内容现在按原样显示为
+  问号，配合下条建议重新提交该任务。
+
+**遗留 / 建议**：`t004_38418118.mp4`、`t005_38418118.mp4` 两条成片的提示词已不可
+恢复，建议在创作台按原意图重提一次；其台账记录保持问号以免伪造历史。
+
+**测试**：`tests/test_multiline_prompt.py` 的兜底用例改写为新口径
+（`test_engine_video_rows_never_guesses_prompt_from_line_number`：空台账 + 非空
+tasks.txt → 必须留空），并新增 `test_engine_video_rows_prompt_comes_from_ledger`
+钉住台账权威映射与换行还原。
+
+## 未发布 — 引擎成片的耗时徽标与视频链接
+
+**问题（用户 2026-10-17 实测反馈）**：任务中心里引擎成片那几行的耗时徽标恒为
+`0M`（看起来像"秒出"，实际是 9~38 分钟）；同一行在列表里还叫 `eng_t001_3`，
+和另外两行**完全重名**；并且「打开 / 预览」点不开。
+
+三个根因，都在**展示层**（引擎本身出片正常，产物完好）：
+
+1. **0M**：`_sync_engine_tasks_to_db` 把 `out/mp4/<f>.mp4` 的**文件 mtime
+   同时**填进 `started_at` 和 `finished_at`，两值恒等 → 前端
+   `finished_at - started_at` 永远算得 0。
+2. **重名**：前端 `id.replace('video_','').slice(0,10)` 把
+   `eng_t001_38418355` / `eng_t001_38418118` / `eng_t001_38418210` 三条
+   **不同**任务都截成 `eng_t001_3` —— tid 每轮从 t001 重排复用，前 10 字符必相同。
+3. **链接死**：`DOLA_PUBLIC_BASE` 写的是 `http://127.0.0.1:8012`，而面板按
+   约定（`DEVELOPMENT.md` §端口约定）监听 **8019** —— 8012 上没有进程，
+   生成的 `video_url` 全部连接被拒。影响范围是全局的：任务中心与视频库里
+   每一行的打开/预览/复制链接都是坏的。
+
+**修复**：
+
+- **真实时刻从台账取**（`server._engine_video_rows`）：`ledger.jsonl` 里
+  `accepted`（受理，带 conv + tstr）与 `harvest`（成片落盘）成对存在，
+  两个 tstr 就是真实起止。配对键用 **conv**，不能按 tid —— tid 每轮重排复用，
+  同一 tid 在台账里有多代记录，按 tid 配会张冠李戴。
+- **老行就地修复**（`server._heal_engine_timestamps`）：每次同步时幂等地把
+  已被写坏的行（两值相等或为空）纠正回来，无需手工删库重灌；已经是正常耗时的
+  行不被覆盖。
+- **认不出时刻就诚实留空**：只有 harvest、没有 accepted 的 `probe_*`/bonus 片
+  `started_at` 留空，前端显示 **`—`**，绝不再拿 mtime 造一个假起点凑成 `0M`。
+- **ID 不再撞车**：前端 `shortId()` 保留尾部区分段
+  （`eng_<tid>_<conv>.mp4` → `eng_<tid>_<conv>`），超长才中间省略。
+- **端口对齐**：`.env.local` 的 `DOLA_PUBLIC_BASE` 改为 `http://127.0.0.1:8019`
+  并同步重启面板；存量 12 行库记录的旧 `8012` URL 由同步逻辑自动改写为 8019。
+
+**测试**：新增 `tests/test_engine_elapsed.py`（6 例）：accepted→harvest 真实耗时、
+按 conv 而非 tid 配对（三个同名 t001 各配自己那一次）、bonus 片不留假 0M、
+落库两值不等、老行修复且幂等、健康行不被覆盖。
+
+---
+
+## 未发布 — 多行提示词不再被拆成多条任务
+
+**问题**：在创作台粘贴一整段带时间轴的分镜剧本（30 秒视频的 6 个镜头），
+提交后任务中心多出十几条任务，每条只拿到一个时间戳行 —— 一部片子被拆成
+一堆 5 秒碎片，且提示词在列表里看起来像乱码。
+
+**根因**：`tasks.txt` 的文件协议是「一行一条提示词」，而所有提交路径都用
+`splitlines()` 按行拆；多行提示词写进文件后，**每一行都被当成独立任务**。
+
+**修复（三层）**：
+
+1. **存储层**：写入前把换行转成 `\n` 字面量、读出来时还原。
+   `run_pool._escape_prompt_newlines` / `_unescape_prompt_newlines`，
+   `pool_engine_service.escape_prompt_newlines` / `unescape_prompt_newlines`。
+   单行提示词**字节级不变**（老队列零影响）。
+2. **拆分层**：`server._split_prompt_blocks(text, whole=…)` 两种模式 ——
+   - `whole=True`（**创作台 / 发起出片**）：整段输入作为**一条**任务，
+     段内换行保留（空行压掉，上游提示词不需要）；
+   - `whole=False`（**批量出片**，默认）：按「空行分段」拆任务，一段一条；
+     没有空行时退化为一行一条（textarea 一行一条的旧行为不变）。
+3. **展示层**：所有读 `tasks.txt` 的路径（任务中心、队列面板、查看视频、
+   停机反推、清空保留）都还原换行，面板看到的是用户原始输入。
+
+涉及文件：`run_pool.py`、`pool_engine_service.py`、`server.py`、`web/index.html`；
+新增 `tests/test_multiline_prompt.py`（26 例，覆盖转义往返、引擎读回、
+清空不摊平、提交幂等、prio 共存、meta 对齐、拆分层、面板展示）。
+
+前端同步：创作台提交时提示「共 N 行，作为 1 条任务提交」；「发起出片」
+弹窗的预估文案改为「共 1 条任务 × 每条 N 个」，并说明整段提示词不被按行拆开。
+
+**测试**：`tests/test_multiline_prompt.py`（26 例）+ `tests/test_studio_one_window_one_task.py`
+（4 例，直接用用户那段 30 秒分镜剧本跑完整链路）。全量 `pytest tests/`：
+**511 passed**；20 个失败全部为**预先存在**（文件 mtime 均早于本轮：`proxy_store.py`
+10-16 23:20、`browser_pool.py` 10-16 07:11、`pure_api_gen.py` 10-16 04:18，
+其余 10-12），与本次改动无关，清单见下。
+
+预先存在的失败（**均非本轮引入**，未修复）：
+
+| 测试 | 现象 |
+|---|---|
+| `test_cookie_export.py::test_export_account_shape` | `assert 13 == 3` |
+| `test_extract_proxy.py`（8 个） | 节点分配 / 轮换 / 过期 / 死亡节点判定 |
+| `test_manual_nodes.py::test_each_account_gets_its_own_node` | `proxy_url_for('ck10')` 返回空（环境数据状态） |
+| `test_native_duration.py`（2 个） | 时长档位断言与实现不一致 |
+| `test_pure_api_split.py`（6 个） | 测试是 10-12 旧断言，`pure_api_gen.py` 10-16 04:18 已改语义 |
+| `test_testgen_retry.py`（2 个） | 只提交 1 次期望 3 次，与 `browser_pool.py` 10-16 07:11 的新语义不匹配 |
+
+---
+
 ## 2.2.0 — 2026-10-12
 
 新增**豆包渠道（www.doubao.com）**——与 dola 平行的第二条出片通道，

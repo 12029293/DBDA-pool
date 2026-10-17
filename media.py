@@ -34,6 +34,73 @@ def is_local_reference(path: str) -> bool:
     return resolved.is_file()
 
 
+def is_asset_reference(path: str) -> bool:
+    """用户素材库里的文件（config.ASSET_DIR 下）—— **永不自动删除**。
+
+    ★ 与 is_local_reference 严格分离（方案文档 §3.1）：
+      · is_local_reference  = refs/ 下的**临时物化产物**：任务终态被
+        cleanup_local_references 删、服务启动被 sweep_stale_references 清；
+      · is_asset_reference  = assets/ 下的**用户长期资产**：上述两个函数
+        **不认识它**，因此天然免疫 —— 这是"素材库不丢文件"的根本保证。
+
+    素材路径必须能被 validate_reference_urls 放行，否则「引用素材 → 提交上游」
+    这条链路第一步就会被拒成"只支持 http/https"。
+    """
+    if not isinstance(path, str) or not path or "://" in path:
+        return False
+    root = getattr(config, "ASSET_DIR", None)
+    if not root:
+        return False
+    try:
+        resolved = Path(path).resolve()
+        resolved.relative_to(Path(root).resolve())
+    except (OSError, ValueError):
+        return False
+    return resolved.is_file()
+
+
+def _is_ghost_asset_ref(path: str) -> bool:
+    """形如素材库路径、但文件已不在（被硬删 / 素材库整体搬走）。
+
+    单独给一支是为了把错误说清楚：报"素材文件已删除"，而不是含糊的
+    "只支持 http/https"。与 _is_ghost_local_ref 同理。
+    """
+    if not isinstance(path, str) or not path or "://" in path:
+        return False
+    root = getattr(config, "ASSET_DIR", None)
+    if not root:
+        return False
+    try:
+        resolved = Path(path).resolve()
+        resolved.relative_to(Path(root).resolve())
+    except (OSError, ValueError):
+        return False
+    return not resolved.is_file()
+
+
+def _is_ghost_local_ref(url: str) -> bool:
+    """形如本服务落盘的参考图路径、但文件已不存在（任务被重排/清理过）。
+
+    ★ Windows 修正（2026-10-13）：materialize_data_urls 落盘返回的是**绝对路径**
+    （如 `C:\\...\\refs\\ref_x.png`），旧判断只认 `refs/`、`/` 前缀 —— Windows
+    绝对路径以盘符开头，两分支都不命中，幽灵路径会漏到「只支持 http/https」，
+    误导成格式问题（test_reference_materialize 在 Windows 上必挂即此因）。
+    现在补一支：绝对路径且（解析后）位于 REFERENCE_FILE_DIR 之下也算。
+    """
+    if not isinstance(url, str) or not url or "://" in url or _is_data_image(url):
+        return False
+    legacy = url.startswith(("refs/", "/")) and (
+        Path(config.REFERENCE_FILE_DIR).name in url)
+    if legacy:
+        return True
+    try:
+        under = Path(url).resolve().is_relative_to(
+            Path(config.REFERENCE_FILE_DIR).resolve())
+    except (OSError, ValueError):
+        return False
+    return under
+
+
 def materialize_data_urls(urls: list[str]) -> list[str]:
     """把 data: URL 参考图落盘，返回本地路径列表；其余 URL 原样返回。
 
@@ -180,8 +247,15 @@ def validate_public_url(url: str) -> str:
     if is_local_reference(url):
         # 本服务落盘的参考图（data: URL 物化出来的），直接复用文件
         return str(Path(url).resolve())
-    if isinstance(url, str) and url.startswith(("refs/", "/")) and (
-            Path(config.REFERENCE_FILE_DIR).name in url):
+    if is_asset_reference(url):
+        # ★ 素材库文件（assets/）：本地文件，直接复用、不下载不复制。
+        #   cleanup_local_references / sweep_stale_references 都不认这个目录，
+        #   所以素材不会被任务终态或服务重启清掉。
+        return str(Path(url).resolve())
+    if _is_ghost_asset_ref(url):
+        # 素材记录还在、文件没了（被硬删或素材库被搬走）：说清楚，别报成格式问题
+        raise ValueError(f"素材文件已删除（素材记录仍存在）：{url}")
+    if _is_ghost_local_ref(url):
         # 形如 refs/xxx.png 但文件不在了：多半是任务被重排/清理过，
         # 原来会报「只支持 http/https 公网 URL」，让人以为是格式问题，这里说清楚
         raise ValueError(f"参考图文件已丢失（任务重排或被清理）：{url}")
@@ -225,8 +299,12 @@ async def _validate_url_async(url: str) -> str:
     if is_local_reference(url):
         # 本服务落盘的参考图（data: URL 物化出来的），直接复用文件
         return str(Path(url).resolve())
-    if isinstance(url, str) and url.startswith(("refs/", "/")) and (
-            Path(config.REFERENCE_FILE_DIR).name in url):
+    if is_asset_reference(url):
+        # ★ 素材库文件（assets/）：同 is_local_reference 的处理，直接复用文件
+        return str(Path(url).resolve())
+    if _is_ghost_asset_ref(url):
+        raise ValueError(f"素材文件已删除（素材记录仍存在）：{url}")
+    if _is_ghost_local_ref(url):
         # 形如 refs/xxx.png 但文件不在了（任务重排/被清理）：说清楚，别报成「格式不支持」
         raise ValueError(f"参考图文件已丢失（任务重排或被清理）：{url}")
     if len(url) > 4096:
@@ -325,19 +403,25 @@ async def download_one_image(session: aiohttp.ClientSession, url: str, dest: Pat
 
 
 async def download_reference_images(urls: list[str], task_id: str) -> tuple[Path | None, list[str]]:
-    """下载图片到临时目录，返回 (目录, 本地路径列表)。调用方负责 cleanup。"""
+    """下载图片到临时目录，返回 (目录, 本地路径列表)。调用方负责 cleanup。
+
+    ★ 本地文件（refs/ 物化产物 **与 assets/ 素材**）一律**原地复用**：
+      不下载、不复制、不放进临时目录 —— 因此调用方的 cleanup（rmtree / unlink）
+      也碰不到素材文件（is_local_reference / is_asset_reference 都不会匹配到
+      临时目录里的东西）。
+    """
     urls = await validate_reference_urls(urls)
     if not urls:
         return None, []
-    if all(is_local_reference(u) for u in urls):
-        # 全是本地落盘的参考图：不动它们（生命周期由 server 侧任务结束时的清理负责）
+    if all(is_local_reference(u) or is_asset_reference(u) for u in urls):
+        # 全是本地文件：不动它们（refs/ 的生命周期由 server 清理，assets/ 永不清）
         return None, list(urls)
     root = Path(tempfile.mkdtemp(prefix=f"dola_ref_{task_id}_"))
     try:
         async with aiohttp.ClientSession() as session:
             paths = []
             for index, url in enumerate(urls):
-                if is_local_reference(url):
+                if is_local_reference(url) or is_asset_reference(url):
                     paths.append(url)
                     continue
                 if _is_data_image(url):

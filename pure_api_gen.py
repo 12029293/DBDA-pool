@@ -19,7 +19,16 @@ from pathlib import Path
 from typing import Any, Callable
 
 import config
+import dola_window
 from pure_signer import install
+
+
+# hint855：外部进程（ffmpeg/ffprobe/tasklist 等）不得弹控制台窗。
+# 注意 CREATE_NO_WINDOW 在父进程已有控制台时会被忽略，必须叠加 DETACHED_PROCESS。
+_NO_WIN = 0
+if os.name == "nt":
+    _NO_WIN = (getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+               | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
 
 log = logging.getLogger("dola.pure_api")
 
@@ -102,6 +111,12 @@ class AbnormalNoAckError(PureApiError):
     """派发后 NO_ACK_SECONDS 内上游没有任何回应：账号判【异常】，任务提示重试。"""
 
 
+# 710022002＝全局窗口关（不是瞬时限流、不是这个号的错）。交回窗口嗅探器排队，不换号重试。
+# 同时继承 PureApiError，保证既有 `except PureApiError` 分支仍能接住它。
+class WindowClosedError(PureApiError, dola_window.WindowClosedBase):
+    """提交时全局窗口已关（710022002）：不应换号重试，应由窗口嗅探器重新排队。"""
+
+
 # 异常类失败的统一用户话术（拍板要求）
 ABNORMAL_RETRY_HINT = "生视频过程中出现异常情况，请重试"
 
@@ -163,8 +178,29 @@ def _proto_call(dola, name: str, *args, default=False):
 
 
 def _is_prompt_echo(dola, text: str) -> bool:
-    """这条链路文本是不是我们自己提示词的回显（回显不算「上游回执」）。"""
+    """这条链路文本是不是我们自己提示词的回应（回显不算「上游回执」）。"""
     return bool(_proto_call(dola, "is_prompt_echo_text", text, default=False))
+
+
+def launch_session(dola, session, ctx, *, label: str = "launch") -> None:
+    """建 session 时的「拉活」请求（POST /alice/user/launch）。
+
+    【IPRocket 流量治理 · 2026-10-17】这个请求压缩后仍有 47.5 KB（解压 231 KB），
+    而它只是让上游刷新一次会话状态，对后续 anon / 链路查询 / 提交都不是前置条件。
+    实测 A/B（_diag_launch2.py，各 3 轮）：
+        带 launch  → x-tt-agw-login='1'、最近会话 6 条、/im/chain/single 全通
+        省 launch  → 完全一致
+    所以默认跳过（config.SKIP_LAUNCH=1）。怀疑上游改了拉活时序时设
+    DOLA_SKIP_LAUNCH=0 恢复旧行为。
+
+    注意：这里**吞掉异常**——拉活失败本来就不该中断出片（旧代码也是 try/except）。
+    """
+    if config.SKIP_LAUNCH:
+        return
+    try:
+        dola.dola_api_post_json(session, ctx, "/alice/user/launch", {}, label=label)
+    except Exception as exc:  # noqa: BLE001
+        log.info("%s warning: %s", label, str(exc)[:200])
 
 
 def _load_state(state_file: Path) -> dict[str, Any]:
@@ -680,6 +716,7 @@ def _media_duration(path: Path) -> float | None:
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
              "-of", "default=nw=1:nk=1", str(path)],
             capture_output=True, text=True, timeout=30,
+            creationflags=_NO_WIN,   # hint855：ffprobe 不弹控制台
         )
         return float((proc.stdout or "").strip())
     except Exception:
@@ -693,6 +730,7 @@ def _video_codec(path: Path) -> str | None:
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
              "-show_entries", "stream=codec_name", "-of", "default=nw=1:nk=1", str(path)],
             capture_output=True, text=True, timeout=30,
+            creationflags=_NO_WIN,   # hint855：ffprobe 不弹控制台
         )
         return (proc.stdout or "").strip().lower() or None
     except Exception:
@@ -731,7 +769,8 @@ def ensure_web_playable(path: str | Path) -> Path:
 
 def _run_ffmpeg(cmd: list[str]) -> bool:
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900,
+                              creationflags=_NO_WIN)   # hint855：ffmpeg 不弹控制台
     except FileNotFoundError as exc:
         raise PureApiError(
             "未安装 ffmpeg，无法把两段 15 秒拼接成 30 秒（apt-get install -y ffmpeg）"
@@ -826,10 +865,7 @@ def probe_login_detail(
         agw = dola.agw_login_flag(resp)
         if agw != "1":
             return False, f"not logged in (x-tt-agw-login={agw or 'missing'})", True
-        try:
-            dola.dola_api_post_json(session, ctx, "/alice/user/launch", {}, label="launch")
-        except Exception:
-            pass
+        launch_session(dola, session, ctx, label="probe launch")
         return True, "logged_in", True
     except Exception as exc:
         reason = str(exc).replace("\n", " ")[:400]
@@ -922,10 +958,7 @@ def hello_probe(
             reason = f"被登出（x-tt-agw-login={agw or 'missing'}）"
         else:
             status = "no_reply"      # 先假定没回复；拿到回复再改成 ok
-            try:
-                dola.dola_api_post_json(session, ctx, "/alice/user/launch", {}, label="launch")
-            except Exception as exc:
-                log.info("hello_probe launch warning: %s", str(exc)[:200])
+            launch_session(dola, session, ctx, label="hello_probe launch")
             result = dola.submit_chat_completion(
                 session, ctx, headers, images=[], audios=[], prompt=prompt,
                 duration=0, model="", ratio=None, timeout_sec=timeout_sec,
@@ -1038,10 +1071,7 @@ def generate_pure_video(
         dola.dola_api_post_json(session, ctx, "/alice/user/get_web_anon_id", {}, label="get_web_anon_id")
     except Exception as exc:
         log.info("pure get_web_anon_id warning %s: %s", account, str(exc)[:200])
-    try:
-        dola.dola_api_post_json(session, ctx, "/alice/user/launch", {}, label="launch")
-    except Exception as exc:
-        log.info("pure launch warning %s: %s", account, str(exc)[:200])
+    launch_session(dola, session, ctx, label="pure launch")
 
     pure_model = _map_model(model, duration)
     # 参考图先上传拿到 uri，再和文本提示一起提交（协议层原本就支持）。
@@ -1052,11 +1082,52 @@ def generate_pure_video(
             state_file=state_file, region=region, pc_version=pc_version)
     submit_prompt = (dola.enrich_multi_image_prompt(prompt, len(uploaded_images))
                      if uploaded_images else prompt)
-    submit = dola.submit_chat_completion(
-        session, ctx, headers,
-        images=uploaded_images, audios=[], prompt=submit_prompt, duration=duration,
-        model=pure_model, ratio=ratio, timeout_sec=180, video_ability=True,
-    )
+
+    # ---- 窗口嗅探 + 整池爆发（2026-10-15，goal 612 渠道改造）----
+    # 710022002「目前服務使用量過大」不是瞬时限流、换号也解不了，而是【全局窗口开/关】的
+    # 信号：关着的时候整池怎么打都是 710，开着的时候整池同刻全部放行（fact 528/616）。
+    # 所以这里把「提交」这一步卡在【全局窗口闸门】上——所有 worker 协程都阻塞在同一个
+    # sniffer 事件上，窗口一命中就同刻各自打出自己号的那一发，这就是「整池爆发」。
+    gate = None
+    if config.WINDOW_SNIFF_ENABLED:
+        try:
+            gate = dola_window.ensure_gate_for_account(state_file, proxy=proxy or "")
+        except Exception as exc:  # noqa: BLE001
+            log.info("window gate 装配失败（退回直接提交）: %s", str(exc)[:200])
+            gate = None
+
+    def _do_submit():
+        return dola.submit_chat_completion(
+            session, ctx, headers,
+            images=uploaded_images, audios=[], prompt=submit_prompt, duration=duration,
+            model=pure_model, ratio=ratio, timeout_sec=180, video_ability=True,
+        )
+
+    window_deadline = time.time() + max(30, int(config.WINDOW_WAIT_DEADLINE_SEC))
+    submit = None
+    while True:
+        if gate is not None and gate.enabled():
+            if not gate.wait_for_window(window_deadline, account=account):
+                raise WindowClosedError(
+                    f"{account} 等待生成窗口超时（{config.WINDOW_WAIT_DEADLINE_SEC}s 内未命中全局窗口），"
+                    "已交回窗口嗅探器排队")
+        submit = _do_submit()
+        if not submit.error:
+            break
+        code = str(submit.error_code or "")
+        msg = f"{code}: {submit.error}"
+        if gate is not None and gate.enabled() and gate.classify_submit_error(code, msg) == "window":
+            # 窗口在提交瞬间又关上了：通知哨兵，然后交回窗口嗅探器重新排队。
+            # **不换号**（换号也是同一个全局窗口，纯属白打），只是继续等下一个窗口。
+            gate.note_closed()
+            if time.time() >= window_deadline:
+                raise WindowClosedError(
+                    f"{account} 等下一个生成窗口超时（{config.WINDOW_WAIT_DEADLINE_SEC}s），"
+                    f"已交回窗口嗅探器排队: {msg[:200]}")
+            log.info("pure %s 提交时窗口已关，交回嗅探器排队等下一个窗口", account)
+            continue
+        break
+
     if submit.error:
         msg = f"{submit.error_code or 'upstream'}: {submit.error}"
         if any(k in msg.lower() for k in ("login", "登录", "ログイン", "未登录", "anonymous")):
@@ -1064,6 +1135,8 @@ def generate_pure_video(
         raise PureApiError(f"{account} 提交失败: {msg[:300]}")
     if not submit.conversation_id:
         raise PureApiError(f"{account} 提交未返回 conversation_id")
+    if gate is not None and gate.enabled():
+        gate.note_received(account, submit.conversation_id)
 
     conversation_id = submit.conversation_id
     deadline = time.time() + timeout

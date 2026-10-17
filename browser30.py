@@ -22,6 +22,7 @@
 import asyncio
 import base64
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -30,6 +31,14 @@ import config
 import proxy_fwd
 from pure_api_gen import AbnormalNoAckError, ShortClipError
 from video_worker_ui import CreditInsufficientError, LoginExpiredError
+
+
+# hint855：外部进程（ffmpeg/ffprobe/tasklist 等）不得弹控制台窗。
+# 注意 CREATE_NO_WINDOW 在父进程已有控制台时会被忽略，必须叠加 DETACHED_PROCESS。
+_NO_WIN = 0
+if os.name == "nt":
+    _NO_WIN = (getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+               | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
 
 _HOOK_PATH = Path(__file__).parent / "hook30.js"
 CHAT_URL = "https://www.dola.com/chat/"
@@ -185,7 +194,8 @@ def _ffprobe_duration(path: str) -> float | None:
         out = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
-            capture_output=True, text=True, timeout=60)
+            capture_output=True, text=True, timeout=60,
+            creationflags=_NO_WIN)   # hint855：ffprobe 不弹控制台
         return float(out.stdout.strip())
     except Exception:
         return None

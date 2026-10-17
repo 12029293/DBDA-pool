@@ -36,6 +36,23 @@ if (daemon) {
       process.stdout.write(JSON.stringify(err) + '\n');
     }
   });
+
+  // 生命周期（hint855 第 3 条）：父进程退出/管道关闭后，守护进程必须自杀，
+  // 不得变成无主孤儿（实测历史上曾遗留数十个孤儿 node 守护进程并持续弹出控制台）。
+  const die = () => { try { process.exit(0); } catch (_) {} };
+  rl.on('close', die);
+  process.stdin.on('end', die);
+  process.stdin.on('error', die);
+  process.on('disconnect', die);
+  // 兜底看门狗：父进程 PID 由拉起方通过 DOLA_SIGNER_PARENT_PID 注入；
+  // 父进程消失即退出（taskkill /F 杀父后 stdin 未必立刻 close，靠这条收尾）。
+  const ppid = parseInt(process.env.DOLA_SIGNER_PARENT_PID || '0', 10);
+  if (ppid > 0) {
+    setInterval(() => {
+      try { process.kill(ppid, 0); }
+      catch (e) { die(); }
+    }, 5000).unref();
+  }
 } else {
   let input = '';
   process.stdin.setEncoding('utf8');

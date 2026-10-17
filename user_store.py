@@ -1,4 +1,4 @@
-"""管理员用户存储：登录、增删改子管理员、改密码。
+﻿"""管理员用户存储：登录、增删改子管理员、改密码。
 
 初始账号：admin / admin123（role=owner，不允许删除/禁用/改名）。
 密码使用 PBKDF2-SHA256 + 随机盐存储，绝不明文入库。
@@ -7,6 +7,13 @@ import hashlib
 import hmac
 import os
 import sqlite3
+try:
+    import _safe_sqlite  # thread-safe sqlite3 wrapper (fixes SQLITE_MISUSE)
+except Exception:  # pragma: no cover
+    import os as _os, sys as _sys
+    _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+    import _safe_sqlite
+
 import time
 
 import config
@@ -17,7 +24,7 @@ DEFAULT_ADMIN_PASSWORD = "admin123"
 
 
 def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = _safe_sqlite.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")

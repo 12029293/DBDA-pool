@@ -101,10 +101,12 @@ def test_reset_daily_quotas_restores_blocked_accounts(tmp_path):
 def test_classify_upstream_failure(tmp_path):
     browser_pool, _ = _pool(tmp_path)
 
-    # 瞬时限流：只冷却一小段时间，不能按失败锁到次日
+    # 710022002 = 全局窗口关（2026-10-15 渠道改造）：单独归 "window"，
+    # 处置是【交回窗口嗅探器排队】，不是换号重试、也不是瞬时限流。
     assert browser_pool.classify_upstream_failure(
         "ck459 提交失败: 710022002: 当前服务访问频繁，请稍后重试"
-    ) == "transient"
+    ) == "window"
+    # 非 710 的「访问频繁」话术仍是瞬时限流：只冷却一小段时间，不能按失败锁到次日
     assert browser_pool.classify_upstream_failure("Too Many Requests") == "transient"
 
     # 当日次数用完 / 本单额度不够 / 其它
@@ -243,8 +245,9 @@ def test_upstream_failure_marks_by_kind(tmp_path):
         pool.ensure_account(name)
     now = time.time()
 
-    # 上游「访问频繁」：概念已删除 —— 不冷却、不标失败，只换号重试
-    assert pool._note_upstream_failure("t1", "710022002: 当前服务访问频繁，请稍后重试") == "transient"
+    # 710022002 = 全局窗口关（2026-10-15 渠道改造）：单独归 "window"，
+    # 处置是【交回窗口嗅探器排队】—— 既不换号重试，也不写账号状态。
+    assert pool._note_upstream_failure("t1", "710022002: 当前服务访问频繁，请稍后重试") == "window"
     t1 = pool._meta("t1")
     assert t1["failed_at"] == 0
     assert t1["cooldown_until"] == 0

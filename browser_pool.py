@@ -7,6 +7,13 @@ import asyncio
 import logging
 import shutil
 import sqlite3
+try:
+    import _safe_sqlite  # thread-safe sqlite3 wrapper (fixes SQLITE_MISUSE)
+except Exception:  # pragma: no cover
+    import os as _os, sys as _sys
+    _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+    import _safe_sqlite
+
 import threading
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -19,12 +26,13 @@ from video_worker_ui import (
     generate_video, resume_video,
 )
 from pure_api_gen import (
-    AbnormalNoAckError, ShortClipError, ensure_web_playable, generate_pure_video,
-    hello_probe, probe_login, probe_login_detail,
+    AbnormalNoAckError, ShortClipError, WindowClosedError, ensure_web_playable,
+    generate_pure_video, hello_probe, probe_login, probe_login_detail,
 )
 from browser30 import generate_video_30
 import config
 import cred_store
+import dola_window
 import failure_text
 import proxy_store
 from pool import AccountConfig as _PoolAccountConfig, AccountPool as _PoolEngine
@@ -137,8 +145,15 @@ SHORT_CLIP_MARKERS = (
 
 
 def classify_upstream_failure(message: str) -> str:
-    """把上游失败文案归类：transient / daily / content / quota / other。"""
+    """把上游失败文案归类：window / transient / daily / content / quota / short / other。
+
+    window（2026-10-15 新增）：710022002 是【全局窗口关】而不是「本号/本IP 瞬时限流」——
+    实测一个窗口 ≈2~12s、≈15~23 个/h，开时整池同刻放行。它必须单独归一类，因为处置
+    完全不同：不是「换号重试」，而是【交回窗口嗅探器排队，等下一个窗口再提交】。
+    """
     blob = (message or "").lower()
+    if config.WINDOW_TAKEOVER_710 and "710022002" in blob:
+        return "window"
     if any(marker.lower() in blob for marker in TRANSIENT_THROTTLE_MARKERS):
         return "transient"
     if any(marker.lower() in blob for marker in DAILY_LIMIT_MARKERS):
@@ -225,7 +240,7 @@ class BrowserPool:
         # 两个线程的 BEGIN/COMMIT 互相踩，冒出 `cannot commit - no transaction is active`
         # 把任务判失败（2026-09-23 在并发用例里复现）。自动提交下每条语句各自原子，
         # 代码里原有的 commit() 变成无害的 no-op。
-        self._conn = sqlite3.connect(db_path, check_same_thread=False, isolation_level=None)
+        self._conn = _safe_sqlite.connect(db_path, check_same_thread=False, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         # WAL + synchronous=NORMAL：autocommit 下每条 UPDATE 都即时落盘，本机 fsync
         # 实测 ~40ms/次且这些写大多在事件循环线程里 → 一次写卡住整个服务 40ms+。
@@ -304,6 +319,31 @@ class BrowserPool:
             "WHERE login_ok=1 AND COALESCE(activated_at, 0)=0"
         )
         self._conn.commit()
+        # 一次性回填：号目录里有 cookie_state.json 的号一律标成 cookie 来源。
+        # 2026-10-16 回灌：号池目录可由 junction 指向外部池（如 DBDA\acc），这些号是
+        # 纯 cookie 号（只有 cookie_state.json、没有浏览器 profile），但 accounts_meta
+        # 是在本库新建的行，source 为空 → _is_cookie_source()=False → 会被误判成 login 号
+        # 而去走浏览器出片（本机没有可用 Chromium，只会报 driver 错误）。
+        # 只填空值，绝不覆盖已有的 'cookie'/'login' 判定。
+        _cookie_backfill = 0
+        for _d in (self.accounts_dir.iterdir() if self.accounts_dir.exists() else []):
+            if not _d.is_dir() or _d.name.startswith("."):
+                continue
+            if (_d / "cookie_state.json").is_file():
+                cur = self._conn.execute(
+                    "SELECT source FROM accounts_meta WHERE name=?", (_d.name,)).fetchone()
+                if cur is None:
+                    self._ensure_meta(_d.name)
+                    cur = self._conn.execute(
+                        "SELECT source FROM accounts_meta WHERE name=?", (_d.name,)).fetchone()
+                if cur is not None and not (cur["source"] or "").strip():
+                    self._conn.execute(
+                        "UPDATE accounts_meta SET source='cookie' WHERE name=?", (_d.name,))
+                    _cookie_backfill += 1
+        if _cookie_backfill:
+            self._conn.commit()
+            logger.info("cookie 来源回填 %d 个号（有 cookie_state.json 但 source 为空）",
+                        _cookie_backfill)
         self._engine: _PoolEngine | None = None
 
     # ===== 账号发现/元数据 =====
@@ -539,16 +579,23 @@ class BrowserPool:
         return streak
 
     def _note_upstream_failure(self, account: str, message: str, attempt: int = 0) -> str:
-        """按上游失败文案落状态，返回归类：transient / daily / quota / other。
+        """按上游失败文案落状态，返回归类：window / transient / daily / quota / other。
 
-        - transient：出口 IP/上游瞬时限流（如 710022002「当前服务访问频繁」）→ 只换号重试，
-          「限流」概念已按用户要求删除，不冷却、不标状态；
+        - window（710022002）：【全局窗口关】，不是本号/本IP 的问题 → 不冷却、不换号重试，
+          交回窗口嗅探器排队（由上层 generate_video 的 except WindowClosedError 处理）；
+        - transient：出口 IP/上游瞬时限流（非 710 的其它「访问频繁」话术）→ 只换号重试；
         - daily：当日次数用完 → 标记到额度刷新；
         - quota：本单额度不够（如 30 秒需 3 点只剩 2 点）→ 标记到额度刷新；
         - other：普通生成失败 → 只换号重试；同号连续失败 3 次才进【异常】组（到期自动恢复）。
         """
         kind = classify_upstream_failure(message)
-        if kind == "transient":
+        if kind == "window":
+            print(f"[pool] {account} 全局窗口关闭（710022002），交回窗口嗅探器排队，不换号重试: "
+                  f"{message[:160]}", flush=True)
+            gate = dola_window.get_gate()
+            if gate is not None:
+                gate.note_closed()
+        elif kind == "transient":
             print(f"[pool] {account} 上游拒绝本次提交（访问频繁），换号重试: {message[:160]}",
                   flush=True)
         elif kind == "daily":
@@ -792,6 +839,45 @@ class BrowserPool:
         """
         remark = str((result or {}).get("reason") or "探测未通过")[:200]
         self._set_risk(name, f"你好探测：{remark}")
+
+    # ---- 全局窗口闸门（2026-10-15 渠道改造）----
+    def cookie_state_path(self, name: str) -> str | None:
+        """cookie 源号的纯 API 状态文件（窗口哨兵探针要用）。"""
+        return self._pure_state(name)
+
+    def quota_left(self, name: str) -> int:
+        """该号当日剩余出片配额（用于窗口爆发的准入阈值 WINDOW_QUOTA_THRESHOLD）。"""
+        try:
+            used = self.used_today(name)
+        except Exception:  # noqa: BLE001
+            return int(config.DAILY_LIMIT)
+        return max(0, int(config.DAILY_LIMIT) - int(used or 0))
+
+    def proxy_url_for(self, name: str) -> str:
+        """该号出片用的代理 URL（窗口爆发提交时按号取出口）。"""
+        try:
+            return self._proxy_url_for(name)
+        except Exception:  # noqa: BLE001
+            return config.PROXY or ""
+
+    def start_window_engine(self) -> dict:
+        """启动【全局窗口嗅探器】（幂等）：server 启动时调一次即可。
+
+        哨兵只用池里第一个 cookie 号当探针（省额度）；窗口命中后，所有走纯 API 的
+        worker 协程会从同一个事件上同时醒过来、同刻各自打出自己号的那一发提交。
+        """
+        gate = dola_window.start_for_pool(
+            self.accounts, cookie_state_of=self.cookie_state_path,
+            report_path=dola_window._default_report_path())
+        if gate is None:
+            return {"enabled": False}
+        return {"enabled": True, **gate.state()}
+
+    def window_state(self) -> dict:
+        gate = dola_window.get_gate()
+        if gate is None:
+            return {"enabled": False, "reason": "未启动 / DOLA_WINDOW_SNIFF=0"}
+        return {"enabled": True, **gate.state()}
 
     def probe_hello(self, name: str, *, force: bool = False,
                     apply_risk: bool = True) -> dict:
@@ -1312,9 +1398,9 @@ class BrowserPool:
                 self._set_credit_balance(account, balance, source)
 
             try:
-                # 上游会按出口 IP 对提交频率限流（710022002「当前服务访问频繁」），
-                # 号池路径遇 transient 是换号重试；测试生成钉死指定账号，换号没意义，
-                # 所以原地等待后重交。默认重试 2 次、间隔 60s（env 可调）。
+                # 2026-10-15 改造：710022002 现在归类为 window（全局窗口关），不再走这里的
+                # 「原地等待重交」——窗口排队已由 pure_api_gen 内部的窗口闸门完成。
+                # 这里只保留对【真正的瞬时抖动】类文案的重交。
                 result = None
                 for attempt in range(config.TESTGEN_TRANSIENT_RETRIES + 1):
                     try:
@@ -1351,6 +1437,10 @@ class BrowserPool:
                 }
             except TimeoutError as exc:
                 return {"ok": False, "account": account, "error": f"生成超时: {exc}"}
+            except WindowClosedError as exc:
+                # 测试生成钉死指定账号：窗口关没法靠等换号解决，窗口嗅探器已在内部排队等过，
+                # 如实回报「等待生成窗口超时」。
+                return {"ok": False, "account": account, "error": f"等待生成窗口超时: {exc}"}
             except ShortClipError as exc:
                 # 只给了短视频（例如 30 秒只回 15 秒）：不拼接、也不把这个号标成失败。
                 return {"ok": False, "account": account, "error": str(exc)[:300]}
@@ -1752,6 +1842,15 @@ class BrowserPool:
                             # profile 缺失不能一直重试：进【异常】组，到期自动恢复
                             self._mark_abnormal(account, f"profile 缺失: {e}")
                             last_err = e; self._last_attempt_err = e
+                        except WindowClosedError as e:
+                            # 710022002＝全局窗口关。换号毫无意义（全池同一个窗口），
+                            # 也不能把这号标失败。窗口排队已由 pure_api_gen 内部完成
+                            # （gate.wait_for_window 循环），这里等超时了才冒出来 →
+                            # 如实上报「等待窗口超时」，不再烧其它号各等一遍。
+                            print(f"[pool] {account} 等待全局生成窗口超时，交回窗口嗅探器排队: {e}",
+                                  flush=True)
+                            self._last_attempt_err = e
+                            raise
                         except Exception as e:
                             message = str(e)
                             self._note_upstream_failure(account, message, attempt)

@@ -38,8 +38,10 @@ from pathlib import Path
 import config
 from doubao_cn_video import (
     CN_DOMAIN,
+    DoubaoButtonConfirmError,
     DoubaoCreditError,
     DoubaoLoginError,
+    DoubaoPaidQuotaError,
     DoubaoThrottleError,
     DoubaoVideoClient,
     ck_domain,
@@ -113,7 +115,22 @@ MODEL_DURATIONS = {
     "seedance_v2.0_mini": (5, 10, 15),
     "seedance_v2.5": (5, 10, 15, 30),
 }
-RATIOS = ("21:9", "16:9", "4:3", "1:1", "3:4", "9:16")
+# ★ 2026-10-16：比例表加 3:2 / 2:3 / 4:5 / 5:4。
+#   **只有 Seedream 图片**原生支持 3:2 系：视频侧的比例档位来自网页版真实配置
+#   （extensions/dola30/doubao-skill-pack-response.json 的 ratio.options 只有
+#    1:1/3:4/4:3/9:16/16:9/21:9），所以视频用 VIDEO_RATIOS 子集，
+#   避免用户"选了 3:2 却出 16:9"（静默不生效比报错更糟）。
+RATIOS = ("21:9", "16:9", "3:2", "4:3", "1:1",
+          "4:5", "5:4", "3:4", "2:3", "9:16")
+
+# 视频可用比例：不含 3:2 系（上游视频对这几档不生效）
+VIDEO_RATIOS = ("21:9", "16:9", "4:3", "1:1", "3:4", "9:16")
+
+# ---- Seedream 文生图档位（2026-10-16 新增）----
+# 对外模型键；正文模型文案与吸附逻辑见 `doubao_image.resolve_image_model`。
+IMAGE_MODELS = ("seedream-4.0", "seedream-4.5",
+                "seedream-5.0-pro", "seedream-5.0-flash")
+IMAGE_RATIOS = RATIOS
 
 DAILY_LIMIT = int(os.environ.get("DOUBAO_DAILY_LIMIT", "1"))
 COOLDOWN_SECONDS = int(os.environ.get("DOUBAO_COOLDOWN_SECONDS", "1800"))
@@ -124,6 +141,13 @@ COOLDOWN_SECONDS = int(os.environ.get("DOUBAO_COOLDOWN_SECONDS", "1800"))
 #   TRANSIENT_COOLDOWN_SEC 口径。
 TRANSIENT_COOLDOWN_SEC = int(os.environ.get("DOUBAO_TRANSIENT_COOLDOWN_SEC", "600"))
 
+# ★ 2026-10-14：命中「付费额度确认卡」（今日免费额度已用完）时，把该账号
+#   **临时挪出调度**多久。理由：这类卡只有客户端能点，且**每次免费额度耗尽后
+#   都会重现**——留在池里只会让后续任务继续撞同一堵墙。挪出后号池会自动换到
+#   仍有免费额度的号出片；免费额度按自然日重置，故默认 6 小时。
+PAID_QUOTA_COOLDOWN_SEC = int(
+    os.environ.get("DOUBAO_PAID_QUOTA_COOLDOWN_SEC", str(6 * 3600)))
+
 NAME_RE = re.compile(r"^[A-Za-z0-9_\-\u4e00-\u9fa5]{1,32}$")
 
 # 分组名与 dola 池保持一致，面板的分组筛选按钮可直接复用
@@ -133,7 +157,22 @@ GROUP_BUSY = "生成中"
 GROUP_RISK = "风控"
 GROUP_PENDING = "待激活"
 GROUP_ABNORMAL = "异常"
+GROUP_WARMUP = "预热"
 ACTIVE_GROUPS = (GROUP_FULL, GROUP_COOLING, GROUP_BUSY)
+
+# ★ 2026-10-13（真号实测）：新扫码入池的号存在**风控预热期**。
+#   证据：db002 扫码入池后 4.3 分钟就发任务 → `/chat/completion` 直接
+#   SSE_HEARTBEAT→STREAM_ERROR 710022002（连 SSE_ACK 都没有，会话没建起来）；
+#   同一出口 IP 下 13 小时前的 db001 probe=ok ⇒ 不是 IP 问题，是新号被观察。
+#   处置：配合 `DOUBAO_WARMUP_SECONDS` 让新号静默一段再参与**自动调度**
+#   （避免刚入池即被风控、并把限流冷却时间省下来）。
+#
+#   ★ 默认 **0 = 关闭**：预热是「锦上添花」的优化，不是必须行为。
+#     默认开启会改变既有语义（刚加号不能马上用），也影响夹具测试；
+#     需要时显式设置，例如 `DOUBAO_WARMUP_SECONDS=1800`（30 分钟）。
+#     无论是否开启，「冷却中」的账号始终不参与调度（既有逻辑）。
+#     手动「测试生成」不受预热限制（用户明确意图，且能立刻拿到真实反馈）。
+WARMUP_SECONDS = int(os.environ.get("DOUBAO_WARMUP_SECONDS", "0"))
 
 _DAY_FMT = "%Y-%m-%d"
 
@@ -145,6 +184,19 @@ def usage_day(now: float | None = None) -> str:
         return _dola_day()
     except Exception:
         return time.strftime(_DAY_FMT, time.localtime(now or time.time()))
+
+
+def _is_image_rejected(exc: Exception) -> bool:
+    """是否为「提示词级拒绝」（上游明确回复了拒绝理由，换号无效）。
+
+    惰性 import：号池模块在无豆包环境时也要能 import（`doubao_image`
+    本身依赖 `doubao_cn_video`，缺失时退化成"永不命中"）。
+    """
+    try:
+        from doubao_image import DoubaoImageRejectedError
+    except Exception:  # noqa: BLE001
+        return False
+    return isinstance(exc, DoubaoImageRejectedError)
 
 
 def resolve_model(model: str | None) -> str:
@@ -296,6 +348,9 @@ class DoubaoAccountStore:
         sessionid = jar.get("sessionid") or ""
         merged = {
             "created_at": old.get("created_at") or time.time(),
+            # ★ 首次入池时间（新号预热期基准）：老号没有该字段 → 不打扰
+            "added_at": float(old.get("added_at") or old.get("created_at")
+                              or time.time()),
             "updated_at": time.time(),
             "sessionid": sessionid,
             "sessionid_head": sessionid[:16],
@@ -474,11 +529,45 @@ class DoubaoPool:
             return DoubaoImageVideoClient(ck, proxy=self.proxy or None)
         return DoubaoVideoClient(ck, proxy=self.proxy or None)
 
+    def _image_client_for(self, name: str):
+        """**文生图**（Seedream）客户端。
+
+        ★ 与 `_client_for(with_image=True)` 不是一回事，别搞混：
+          · `with_image=True` = **图生视频**（视频通道 + 参考图上传，ability_type=17）；
+          · 本方法 = **文生图**（content_type=2009 + skill 3，结果直接在 SSE 里）。
+        """
+        ck = self.store.read_ck(name)
+        if not ck:
+            raise FileNotFoundError(f"豆包账号缺少 ck.txt: {name}")
+        from doubao_image import DoubaoImageClient
+        return DoubaoImageClient(ck, proxy=self.proxy or None)
+
+    def _warmup_left(self, meta: dict, now: float) -> int:
+        """新号预热剩余秒数（0 = 已过预热期或预热被关闭）。
+
+        基准取 `added_at`；老号没有该字段时回落 `created_at`
+        （老库账号创建已久 → 自然为 0，不会被误伤；刚入池的新号则照常预热）。
+        `DOUBAO_WARMUP_SECONDS=0` 可整机关闭该机制。
+        """
+        if WARMUP_SECONDS <= 0:
+            return 0
+        added = float(meta.get("added_at") or meta.get("created_at") or 0)
+        if added <= 0:
+            return 0
+        left = int(added + WARMUP_SECONDS - now)
+        return left if left > 0 else 0
+
     def _group_of(self, meta: dict, now: float, busy: bool) -> tuple[str, str]:
         if meta.get("login_ok") is False:
             return GROUP_RISK, str(meta.get("last_err") or "登录态失效")
         if meta.get("login_ok") is None:
             return GROUP_PENDING, "尚未完成首次验活"
+        # ★ 新号预热期（见 WARMUP_SECONDS 注释）：静默等待，不派任务
+        warm_left = self._warmup_left(meta, now)
+        if warm_left > 0:
+            return GROUP_WARMUP, (
+                "新号预热中（避免刚入池即被风控，%d 分 %d 秒后自动可调度）"
+                % (warm_left // 60, warm_left % 60))
         if busy:
             return GROUP_BUSY, "正在生成"
         cd = float(meta.get("cooldown_until") or 0)
@@ -530,6 +619,7 @@ class DoubaoPool:
                 "remaining": max(0, self.daily_limit - used),
                 "group": group,
                 "group_reason": reason,
+                "warmup_left": self._warmup_left(meta, now),
                 "sessionid_head": meta.get("sessionid_head") or "",
             })
         out.sort(key=lambda x: x["created_at"], reverse=True)
@@ -538,7 +628,8 @@ class DoubaoPool:
     def summary(self) -> dict:
         accs = self.list_accounts()
         counts = {g: 0 for g in (GROUP_FULL, GROUP_COOLING, GROUP_BUSY,
-                                 GROUP_RISK, GROUP_PENDING, GROUP_ABNORMAL)}
+                                 GROUP_RISK, GROUP_PENDING, GROUP_ABNORMAL,
+                                 GROUP_WARMUP)}
         for a in accs:
             counts[a["group"]] = counts.get(a["group"], 0) + 1
         return {
@@ -546,9 +637,11 @@ class DoubaoPool:
             "groups": counts,
             "all_count": len(accs),
             "valid_count": sum(counts[g] for g in ACTIVE_GROUPS),
+            "warmup_count": counts.get(GROUP_WARMUP, 0),
             "remaining_quota": sum(a["remaining"] for a in accs
                                    if a["group"] in ACTIVE_GROUPS),
             "daily_limit": self.daily_limit,
+            "warmup_seconds": WARMUP_SECONDS,
         }
 
     @property
@@ -754,6 +847,9 @@ class DoubaoPool:
                 continue
             if meta.get("login_ok") is not True:
                 continue
+            # ★ 新号预热期内不派任务（打了也是 710022002，还加重风控）
+            if self._warmup_left(meta, now) > 0:
+                continue
             if float(meta.get("cooldown_until") or 0) > now:
                 continue
             if int(meta.get("used_today") or 0) >= self.daily_limit:
@@ -765,7 +861,7 @@ class DoubaoPool:
 
     async def _run_one(self, name: str, prompt: str, ratio: str, duration: int,
                        model: str, image_paths: list[str] | None = None,
-                       timeout: int = 300, on_poll=None) -> dict:
+                       timeout: int | None = None, on_poll=None) -> dict:
         """单账号出片（参考图走 DoubaoImageVideoClient 上传链路）。
 
         ★ 时长按**模型各自的滑条区间**校验（从真实 action_bar 配置解出）：
@@ -781,6 +877,10 @@ class DoubaoPool:
         if not (lo <= dur <= hi):
             raise ValueError(
                 f"{model_cn} 支持的时长为 {lo}~{hi} 秒（收到 {dur} 秒）")
+        # ★ 2026-10-14：出片等待窗口默认取 DOUBAO_VIDEO_TIMEOUT（900 秒）。
+        #   上游对 30 秒片自述「预计等待 15 分钟」，旧的 300 秒必在出片前超时。
+        if timeout is None:
+            timeout = int(os.environ.get("DOUBAO_VIDEO_TIMEOUT", "900"))
         with_image = bool(image_paths)
         cli = self._client_for(name, with_image=with_image)
         if with_image:
@@ -788,10 +888,11 @@ class DoubaoPool:
             path = image_paths[0]
             url = await cli.generate_video_with_image(
                 path, prompt, ratio=ratio, duration=dur, model=model_cn,
-                timeout=timeout)
+                timeout=timeout, on_poll=on_poll)
         else:
             url = await cli.generate_video(prompt, ratio=ratio, duration=dur,
-                                           model=model_cn, timeout=timeout)
+                                           model=model_cn, timeout=timeout,
+                                           on_poll=on_poll)
         # ★ 用上游真实会话 ID（SSE_ACK 回填）；`_local_conv_id` 只是 referer 占位。
         conv_id = getattr(cli, "last_conversation_id", "") or ""
         return {"video_url": url, "conversation_id": conv_id, "account": name,
@@ -813,6 +914,154 @@ class DoubaoPool:
                     async for chunk in r.content.iter_chunked(1 << 16):
                         f.write(chunk)
         return str(fname)
+
+    # ---------- 文生图（Seedream） ----------
+
+    async def _download_image(self, url: str, name: str) -> str:
+        """下载一张生成图到 ``doubao_images/``（扩展名按 URL/内容判断）。"""
+        import aiohttp
+
+        ext = ".png"
+        low = (url or "").lower()
+        for cand in (".jpeg", ".jpg", ".png", ".webp"):
+            if cand in low:
+                ext = cand
+                break
+        out_dir = Path(os.environ.get("DOUBAO_IMAGE_DIR", "doubao_images"))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        fname = out_dir / (
+            f"{name}_{time.strftime('%Y%m%d_%H%M%S')}_{os.urandom(3).hex()}{ext}")
+        proxy = None if getattr(config, "DOWNLOAD_DIRECT", True) else (self.proxy or None)
+        async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=300)) as s:
+            kw = {"proxy": proxy} if proxy else {}
+            async with s.get(url, **kw) as r:
+                r.raise_for_status()
+                with open(fname, "wb") as f:
+                    async for chunk in r.content.iter_chunked(1 << 16):
+                        f.write(chunk)
+        return str(fname)
+
+    async def _run_one_image(self, name: str, prompt: str, ratio: str,
+                             model: str, timeout: int | None = None) -> dict:
+        """单账号文生图（Seedream，不走轮询：结果直接在 SSE 里）。"""
+        if timeout is None:
+            timeout = int(os.environ.get("DOUBAO_IMAGE_TIMEOUT", "300"))
+        cli = self._image_client_for(name)
+        res = await cli.generate_image(prompt, ratio=ratio or "1:1",
+                                       model=model or IMAGE_MODELS[1],
+                                       timeout=timeout)
+        return {"images": list(res.get("images") or []),
+                "conversation_id": res.get("conversation_id", ""),
+                "text": res.get("text", ""),
+                "account": name,
+                "model": model or IMAGE_MODELS[1],
+                "ratio": ratio or "1:1"}
+
+    async def generate_image(self, prompt: str, ratio: str | None = None,
+                             model: str = "seedream-4.5",
+                             on_account_try=None, max_attempts: int = 0,
+                             deadline: float | None = None) -> dict:
+        """号池出图：挑号 → 失败换号 → 到点抛错。
+
+        与 ``generate_video`` 同一套换号/额度/冷却纪律（这是号池的核心价值），
+        差别只在①没有时长参数 ②结果不走轮询。
+        """
+        if not self.accounts:
+            raise RuntimeError("豆包号池为空（doubao_accounts/ 下没有账号）")
+        tried: list[str] = []
+        errors: list[str] = []
+        last_exc: Exception | None = None
+        while deadline is None or time.time() < deadline:
+            if max_attempts and len(tried) >= max_attempts:
+                break
+            cands = [n for n in self._select() if n not in tried]
+            if not cands:
+                if not self._select():
+                    break
+                if all(n in tried for n in self.accounts):
+                    break
+                await asyncio.sleep(2)
+                continue
+            name = cands[0]
+            tried.append(name)
+            if on_account_try:
+                try:
+                    on_account_try(name, len(tried))
+                except Exception:
+                    pass
+            try:
+                async with self.lock_for(name):
+                    res = await self._run_one_image(name, prompt,
+                                                    ratio or "1:1", model)
+                    locals_: list[str] = []
+                    for url in res["images"]:
+                        try:
+                            locals_.append(await self._download_image(url, name))
+                        except Exception:
+                            continue
+                self.store.charge(name, 1)
+                self.store.patch_meta(name, login_ok=True, verified_at=time.time(),
+                                      last_err="")
+                return {"images": res["images"], "local_paths": locals_,
+                        "source_urls": list(res["images"]),
+                        "conversation_id": res.get("conversation_id", ""),
+                        "text": res.get("text", ""), "account": name,
+                        "model": res.get("model", model)}
+            except DoubaoCreditError as exc:
+                self.store.patch_meta(name, used_today=self.daily_limit,
+                                      last_err=str(exc)[:200], updated_at=time.time())
+                last_exc = exc
+                errors.append(f"{name}: {str(exc)[:80]}")
+            except DoubaoLoginError as exc:
+                self.store.cooldown(name, self.cooldown_seconds, str(exc))
+                self.store.patch_meta(name, login_ok=False)
+                last_exc = exc
+                errors.append(f"{name}: {str(exc)[:80]}")
+            except Exception as exc:  # noqa: BLE001
+                # ★ 提示词级拒绝（上游明确回复了拒绝理由）：换号也一样被拒，
+                #   直接抛出，别把整池号白跑一遍。按**异常类型**判定，
+                #   不靠消息里的关键词（该类型的提示文案自带"风控/拒绝"字样，
+                #   字符串匹配会把可重试的空响应也误判成不可重试）。
+                if _is_image_rejected(exc):
+                    raise
+                kind = self._classify_failure(exc)
+                msg = f"{type(exc).__name__}: {exc}"
+                if kind == "throttled":
+                    self.store.cooldown(name, TRANSIENT_COOLDOWN_SEC,
+                                        "上游限流: " + msg[:160], kind="throttled")
+                elif kind == "credit":
+                    self.store.patch_meta(name, used_today=self.daily_limit,
+                                          last_err=msg[:200], updated_at=time.time())
+                elif kind == "login":
+                    self.store.cooldown(name, self.cooldown_seconds, msg, kind="login")
+                    self.store.patch_meta(name, login_ok=False)
+                elif kind == "paid":
+                    self.store.cooldown(
+                        name, PAID_QUOTA_COOLDOWN_SEC,
+                        "今日免费额度已用完，需客户端点「确认生成」同意付费；"
+                        "已临时移出调度 %d 小时（跨日自动恢复）: %s"
+                        % (PAID_QUOTA_COOLDOWN_SEC // 3600, msg[:140]),
+                        kind="paid")
+                else:
+                    self.store.patch_meta(name, last_err=msg[:200],
+                                          updated_at=time.time())
+                last_exc = exc
+                errors.append(f"{name}: {str(exc)[:80]}")
+        if last_exc is not None:
+            raise RuntimeError(
+                "豆包域生图失败（已尝试: %s）· %s"
+                % ("、".join(tried) or "无", "；".join(errors[-3:]) or str(last_exc)))
+        warm = [(n, self._warmup_left(
+                    self.store.roll_day(self.store.read_meta(n)), time.time()))
+                for n in self.accounts]
+        warming = [(n, w) for n, w in warm if w > 0]
+        if warming and len(warming) == len(self.accounts):
+            soon = min(w for _, w in warming)
+            raise RuntimeError(
+                "豆包号池全部处于新号预热期（最近一个还需 %d 分 %d 秒）"
+                % (soon // 60, soon % 60))
+        raise RuntimeError("豆包域没有可用账号（全部冷却/额度用尽/未验活）")
 
     def _classify_failure(self, exc: Exception) -> str:
         """把出片失败归类：`login` / `throttled` / `credit` / `other`。
@@ -840,6 +1089,20 @@ class DoubaoPool:
                        "登录态无效", "user invalid"):
             if marker.lower() in low:
                 return "login"
+        # ★ 2026-10-14：付费额度确认卡（今日免费额度已用完）——**先于**通用
+        #   manual 判定。与「素材授权卡」不同，这类卡每次免费额度耗尽的号都会
+        #   重现，换号可解（号池核心价值），故单独归类为 `paid`。
+        if isinstance(exc, DoubaoPaidQuotaError) or "免费额度已用完" in msg:
+            return "paid"
+        # ★ 2026-10-13：按钮确认卡（10103）= 需要人工去 App 点击，
+        #   既不是账号问题也不是限流 —— 不冷却、不记账，直接把提示带回面板。
+        if "确认生成」按钮卡" in msg or "DoubaoButtonConfirmError" in msg:
+            return "manual"
+        # ★ 2026-10-14：已建成会话、只是**轮询超时**（实测 30 秒片要等 5~15 分钟）。
+        #   上游很可能仍在生成，换号重提只会重复出片 + 重复扣额度，
+        #   所以单独归类，让调用方停止换号。
+        if "超时未出片" in msg:
+            return "timeout"
         # 限流 / 访问频繁：短冷却，绝不标登录失效
         for marker in ("710022002", "710022004", "访问频繁", "限流", "rate limit",
                        "too many requests", "稍后重试", "服务繁忙", "请求过于频繁",
@@ -899,6 +1162,15 @@ class DoubaoPool:
                 elif kind == "login":
                     self.store.cooldown(name, self.cooldown_seconds, msg, kind="login")
                     self.store.patch_meta(name, login_ok=False)
+                elif kind == "paid":
+                    # ★ 2026-10-14：今日免费额度已用完 → 该号临时挪出调度，
+                    #   号池自动换到仍有免费额度的号（免费额度按自然日重置）。
+                    self.store.cooldown(
+                        name, PAID_QUOTA_COOLDOWN_SEC,
+                        "今日免费额度已用完，需客户端点「确认生成」同意付费；"
+                        "已临时移出调度 %d 小时（跨日自动恢复）: %s"
+                        % (PAID_QUOTA_COOLDOWN_SEC // 3600, msg[:140]),
+                        kind="paid")
                 else:
                     self.store.patch_meta(name, last_err=msg[:200],
                                           updated_at=time.time())
@@ -926,7 +1198,8 @@ class DoubaoPool:
                              duration: int = 5, model: str = "seedance-2.0",
                              image_paths: list[str] | None = None,
                              on_account_try=None, max_attempts: int = 0,
-                             deadline: float | None = None) -> dict:
+                             deadline: float | None = None,
+                             on_poll=None) -> dict:
         """号池出片：挑号 → 失败换号 → 到点抛错。返回与 BrowserPool 同形。"""
         if not self.accounts:
             raise RuntimeError("豆包号池为空（doubao_accounts/ 下没有账号）")
@@ -938,6 +1211,15 @@ class DoubaoPool:
                 break
             cands = [n for n in self._select() if n not in tried]
             if not cands:
+                # ★ 2026-10-13 修复死循环：`_select()` 会因**冷却/额度用尽/
+                #   调度关闭/新号预热**过滤掉账号，因此「候选为空」并不等于
+                #   「所有号都试过了」。原实现只看 `all(n in tried)`，当池里
+                #   没有任何可调度号时 tried 仍为空 → 该判断为 False →
+                #   无限 sleep(2) 直到 deadline（实测把测试卡死 240s+）。
+                #   正确做法：先看**全量可调度号**是否为空；空 = 号池当前不可用，
+                #   立即判失败（附预热/冷却剩余时间），不要空等。
+                if not self._select():
+                    break
                 if all(n in tried for n in self.accounts):
                     break
                 await asyncio.sleep(2)
@@ -952,7 +1234,8 @@ class DoubaoPool:
             try:
                 async with self.lock_for(name):
                     res = await self._run_one(name, prompt, ratio or "16:9", duration,
-                                              model, image_paths=image_paths)
+                                              model, image_paths=image_paths,
+                                              on_poll=on_poll)
                     local = await self._download(res["video_url"], name)
                 self.store.charge(name, 1)
                 self.store.patch_meta(name, login_ok=True, verified_at=time.time(),
@@ -986,22 +1269,53 @@ class DoubaoPool:
                 elif kind == "login":
                     self.store.cooldown(name, self.cooldown_seconds, msg, kind="login")
                     self.store.patch_meta(name, login_ok=False)
+                elif kind == "paid":
+                    # 付费额度确认卡：换号可解 → 挪出调度后继续换号
+                    self.store.cooldown(
+                        name, PAID_QUOTA_COOLDOWN_SEC,
+                        "今日免费额度已用完，需客户端点「确认生成」同意付费；"
+                        "已临时移出调度 %d 小时（跨日自动恢复）: %s"
+                        % (PAID_QUOTA_COOLDOWN_SEC // 3600, msg[:140]),
+                        kind="paid")
                 else:
                     self.store.patch_meta(name, last_err=msg[:200],
                                           updated_at=time.time())
                 last_exc = exc
                 errors.append(f"{name}: {str(exc)[:80]}")
+                # ★ manual（按钮确认卡）：换号也无济于事（每号都会弹卡），
+                #   立刻终止换号循环，把「去 App 点确认」的提示直接带给调用方。
+                if kind == "manual":
+                    raise DoubaoButtonConfirmError(
+                        "图生视频需人工确认（豆包 App 内点击「确认生成」按钮后重试）: "
+                        + str(exc)[:200]) from exc
+                # ★ timeout（会话已建、只是轮询超时）：上游可能仍在出片，
+                #   换号重提 = 重复出片 + 重复扣额度，直接判失败并把诊断带出去。
+                if kind == "timeout":
+                    raise
         if last_exc is not None:
             raise RuntimeError(
                 "豆包域出片失败（已尝试: %s）· %s"
                 % ("、".join(tried) or "无", "；".join(errors[-3:]) or str(last_exc)))
+        # 池里没有可调度号：区分「全在预热」与其它原因，给出可操作提示
+        warm = [(n, self._warmup_left(
+                    self.store.roll_day(self.store.read_meta(n)), time.time()))
+                for n in self.accounts]
+        warming = [(n, w) for n, w in warm if w > 0]
+        if warming and len(warming) == len(self.accounts):
+            soon = min(w for _, w in warming)
+            raise RuntimeError(
+                "豆包号池全部处于新号预热期（最近一个还需 %d 分 %d 秒）："
+                "刚入池的账号需静默一段时间以避免风控，到期自动可调度"
+                % (soon // 60, soon % 60))
         raise RuntimeError("豆包域没有可用账号（全部冷却/额度用尽/未验活）")
 
 
 __all__ = [
     "DoubaoPool", "DoubaoAccountStore", "resolve_model", "default_proxy",
     "ACCOUNTS_DIR", "UPLOAD_DIR", "MODELS", "DURATIONS", "RATIOS",
+    "IMAGE_MODELS", "IMAGE_RATIOS", "VIDEO_RATIOS",
     "DAILY_LIMIT", "COOLDOWN_SECONDS", "TRANSIENT_COOLDOWN_SEC", "usage_day",
     "GROUP_FULL", "GROUP_COOLING", "GROUP_BUSY", "GROUP_RISK",
-    "GROUP_PENDING", "GROUP_ABNORMAL", "ACTIVE_GROUPS", "CN_DOMAIN",
+    "GROUP_PENDING", "GROUP_ABNORMAL", "GROUP_WARMUP", "ACTIVE_GROUPS",
+    "WARMUP_SECONDS", "CN_DOMAIN",
 ]

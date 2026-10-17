@@ -33,6 +33,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import config
+import asset_store
 import cookie_export as ck_export
 import cred_store
 import failure_text
@@ -44,6 +45,9 @@ from register_service import REG as register_mgr
 import take_service
 import video_pool_service
 from video_pool_service import manager as videopool_mgr
+import pool_engine_service
+from pool_engine_service import manager as poolengine_mgr
+import engine_fallback
 from credential_import import allocate_credentials, parse_account_text
 import doubao_login
 import doubao_pool
@@ -72,6 +76,8 @@ from media import (
     validate_reference_urls,
 )
 from proxy_store import (
+
+
     create_proxy,
     delete_proxy,
     get_account_proxy,
@@ -89,6 +95,13 @@ from user_store import (
     update_user as user_update,
     verify_login as user_verify,
 )
+
+# hint855：外部进程（ffmpeg/ffprobe/tasklist 等）不得弹控制台窗。
+# 注意 CREATE_NO_WINDOW 在父进程已有控制台时会被忽略，必须叠加 DETACHED_PROCESS。
+_NO_WIN = 0
+if os.name == "nt":
+    _NO_WIN = (getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+               | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
 
 Path(config.DOWNLOAD_DIR).mkdir(parents=True, exist_ok=True)
 Path("web").mkdir(parents=True, exist_ok=True)
@@ -121,6 +134,16 @@ DOUBAO_LOGIN_SESSIONS: dict[str, Any] = {}
 DOUBAO_LOGIN_TTL = 600   # 会话保留 10 分钟
 
 app.mount("/videos", StaticFiles(directory=config.DOWNLOAD_DIR), name="videos")
+# 出片引擎（run_pool.py）的成片目录：out/mp4/。引擎与面板共用同一份 acc/ 号池，
+# 但产物分开存（面板 downloads/、引擎 out/mp4/），避免两套命名互相覆盖。
+Path(pool_engine_service.MP4DIR).mkdir(parents=True, exist_ok=True)
+app.mount("/engine-mp4", StaticFiles(directory=str(pool_engine_service.MP4DIR)),
+          name="engine-mp4")
+# 出片引擎的**图片**产物目录：out/img/（Seedream 出图）。
+# ★ 与 engine-mp4 分开：一条图片任务产**多张**图，且前端要直接 <img> 渲染。
+Path(pool_engine_service.IMGDIR).mkdir(parents=True, exist_ok=True)
+app.mount("/engine-img", StaticFiles(directory=str(pool_engine_service.IMGDIR)),
+          name="engine-img")
 # 参考图缩略图（任务结束后唯一能回看的副本）；文件名 = <task_id>_<index>.jpg
 Path(config.THUMB_DIR).mkdir(parents=True, exist_ok=True)
 app.mount("/thumbs", StaticFiles(directory=config.THUMB_DIR), name="thumbs")
@@ -128,6 +151,16 @@ app.mount("/thumbs", StaticFiles(directory=config.THUMB_DIR), name="thumbs")
 Path(doubao_pool.UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
 app.mount("/doubao-uploads", StaticFiles(directory=str(doubao_pool.UPLOAD_DIR)),
           name="doubao-uploads")
+# 素材库（创作台）：用户上传的参考素材 + 生成产物入库。
+# ★ 与 /thumbs、refs/ 严格分开：这里面是**用户长期资产**，
+#   media.cleanup_local_references / sweep_stale_references 都不认这个目录，
+#   所以任务终态与重启都不会删它（见 media.is_asset_reference 与方案 §3.1）。
+asset_store.ensure_dirs()
+assets_root = asset_store.assets_root()
+app.mount("/assets", StaticFiles(directory=str(assets_root)), name="assets")
+# 素材预览图（512px，面板网格墙用）；单独挂载避免把 .thumbs 暴露在 /assets 顶层
+app.mount("/asset-thumbs", StaticFiles(directory=str(asset_store.thumbs_root())),
+          name="asset-thumbs")
 
 
 @app.middleware("http")
@@ -210,6 +243,7 @@ def _probe_with_ffprobe(path: str) -> dict | None:
             ["ffprobe", "-v", "quiet", "-print_format", "json",
              "-show_format", "-show_streams", path],
             capture_output=True, text=True, timeout=15,
+            creationflags=_NO_WIN,   # hint855：ffprobe 不弹控制台
         )
         if proc.returncode != 0:
             return None
@@ -426,6 +460,9 @@ class VideoGenRequest(BaseModel):
     image: Any = None
     input_image: Any = None
     input_images: Any = None
+    # ★ 2026-10-13 新增：出片渠道。`doubao` = 豆包域纯 HTTP 号池
+    # （www.doubao.com，独立配额池，走 doubao_pool）；默认 `dola` 不变。
+    channel: str = "dola"
 
 
 class TestGenRequest(BaseModel):
@@ -962,6 +999,17 @@ def open_thread_pool() -> int:
 async def resume_incomplete_tasks():
     """服务重启后恢复已受理会话，并重新排队尚未开始的 queued 任务。"""
     open_thread_pool()
+    # 2026-10-15 渠道改造：启动【全局窗口嗅探器】。710022002 是全局窗口开/关，
+    # 窗口一命中所有走纯 API 的 worker 会同刻爆发提交；池里没有 cookie 号时自动跳过。
+    try:
+        win = pool.start_window_engine()
+        if win.get("enabled"):
+            print(f"[startup] 窗口嗅探器已启动：探针号={win.get('probe_account')} "
+                  f"周期={win.get('period_sec')}s（DOLA_WINDOW_SNIFF=1）", flush=True)
+        else:
+            print("[startup] 窗口嗅探器未启动（DOLA_WINDOW_SNIFF=0 或池中无 cookie 号）", flush=True)
+    except Exception as exc:
+        print(f"[startup] 窗口嗅探器启动失败（退回旧行为）: {exc}", flush=True)
     # 先处理崩溃时留下的 processing 孤儿任务（有 conversation 保留续轮询，
     # 无 conversation 清空账号重新派号），避免永久卡死。
     stale_refs = sweep_stale_references()
@@ -991,6 +1039,39 @@ async def resume_incomplete_tasks():
     asyncio.create_task(_cred_refresher_loop())
     asyncio.create_task(_daily_quota_reset_loop())
     asyncio.create_task(_task_watchdog_loop())
+    # 引擎退出 → 自动跑豆包降级（把没出片的兜底做掉）。
+    # reaper 是普通线程，必须用 call_soon_threadsafe 挂回事件循环。
+    _install_engine_exit_hook()
+
+
+def _install_engine_exit_hook() -> None:
+    """把「引擎退出」桥接到事件循环里的豆包降级。
+
+    只在引擎**自己跑完/崩溃**时降级；用户点「停止」属于主动中断，不降级
+    （否则用户想停，后台却偷偷去豆包生产，违背意图）。
+    """
+    loop = asyncio.get_running_loop()
+
+    def _on_exit(rc, was_stopping: bool) -> None:
+        if was_stopping:
+            print("[fallback] 引擎由用户停止，跳过豆包降级", flush=True)
+            return
+        def _schedule() -> None:
+            async def _go() -> None:
+                try:
+                    res = await _run_doubao_fallback(f"引擎退出 rc={rc}")
+                    if res.get("skipped"):
+                        print(f"[fallback] 跳过：{res.get('reason')}", flush=True)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[fallback] 降级失败（已忽略）: {exc}", flush=True)
+            asyncio.create_task(_go())
+        try:
+            loop.call_soon_threadsafe(_schedule)
+        except RuntimeError:
+            # 事件循环已关闭（服务正在退出）：不降级，交给下次手动触发
+            pass
+
+    poolengine_mgr.on_exit = _on_exit
 
 
 WATCHDOG_DISPATCHED: set[str] = set()
@@ -1197,6 +1278,11 @@ async def create_video(request: Request, authorization: str | None = Header(defa
     refs = list(dict.fromkeys(refs + _deep_image_urls(raw)))
     if refs:
         print(f"[api] 收到参考图 {len(refs)} 张: {refs[0][:80]}", flush=True)
+    # ★ 2026-10-13 新增：channel=doubao 时改走豆包域纯 HTTP 号池，
+    #   不进 dola 号池/浏览器兜底（两域账号与配额完全隔离）。
+    if (req.channel or "").strip().lower() == "doubao":
+        return await _submit_doubao_task(client, req.model, req.prompt,
+                                         ratio, duration, refs)
     return await _submit_task(client, req.model, req.prompt, ratio, duration, refs)
 
 
@@ -1329,6 +1415,99 @@ async def _submit_task(client, model, prompt, ratio, duration, reference_images)
         progress=_progress_payload(status="queued", created_at=time.time(),
                                    duration=duration),
     )
+
+
+# ===== 豆包渠道对外 REST（2026-10-13 新增，channel=doubao 分流） =====
+
+
+async def _submit_doubao_task(client, model, prompt, ratio, duration, reference_images):
+    """channel=doubao 受理：校验 → 建任务行（channel=doubao）→ 后台跑豆包号池。"""
+    model_cn = doubao_pool.resolve_model(model)
+    if not doubao_pool.duration_supported(model_cn, duration):
+        lo, hi = doubao_pool.duration_range_for(model_cn)
+        raise HTTPException(
+            422, f"{model_cn} 支持的时长为 {lo}~{hi} 秒（收到 {duration} 秒）")
+    if ratio and ratio not in doubao_pool.RATIOS:
+        raise HTTPException(422, f"ratio 仅支持 {doubao_pool.RATIOS}")
+    if duration not in client["allowed_durations"]:
+        raise HTTPException(422, f"当前 API Key 不允许生成 {duration} 秒视频")
+    try:
+        reference_images = await validate_reference_urls(reference_images)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    try:
+        reference_images = await asyncio.to_thread(materialize_data_urls, reference_images)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    if not doubao.accounts:
+        raise HTTPException(503, "doubao pool is empty（doubao_accounts/ 下没有账号）")
+    if len(prompt or "") > config.MAX_PROMPT_CHARS:
+        raise HTTPException(
+            422, f"提示词过长（上限 {config.MAX_PROMPT_CHARS} 字符，收到 {len(prompt)}）")
+    task_id = "video_" + uuid.uuid4().hex
+    try:
+        store.create(
+            task_id,
+            model_cn,
+            prompt,
+            ratio or "16:9",
+            duration,
+            reference_images=json.dumps(reference_images, ensure_ascii=False),
+            channel="doubao",
+            api_key_hash=client["api_key_hash"],
+            api_key_name=client["api_key_name"],
+            daily_limit=client["daily_limit"],
+            concurrency_limit=client["concurrency_limit"],
+            max_pending=config.MAX_PENDING_TASKS,
+        )
+    except TaskQuotaExceeded as exc:
+        raise HTTPException(429, str(exc)) from exc
+    except PendingTaskLimitExceeded as exc:
+        raise HTTPException(429, str(exc)) from exc
+    print(f"[api][doubao] 任务受理 task={task_id} model={model_cn} "
+          f"duration={duration} refs={len(reference_images)}", flush=True)
+    asyncio.create_task(_run_doubao_pool_task(
+        task_id, model_cn, prompt, ratio or "16:9", duration,
+        reference_images, client))
+    return TaskResponse(
+        id=task_id, status="queued", model=model_cn, prompt=prompt,
+        progress=_progress_payload(status="queued", created_at=time.time(),
+                                   duration=duration),
+    )
+
+
+async def _run_doubao_pool_task(task_id, model_cn, prompt, ratio, duration,
+                                reference_images, client):
+    """豆包渠道对外任务执行体：走 doubao_pool.generate_video（选号/换号/冷却/记账内建）。"""
+    await _update(task_id, status="processing", started_at=time.time(),
+                  channel="doubao")
+    deadline = time.time() + config.TASK_DEADLINE
+
+    def _beat(_now=None):
+        """★ 2026-10-14：出片要等 5~15 分钟，必须持续心跳 last_poll_at，
+        否则看门狗（processing 且超过 STALE_TASK_SECONDS 无更新）会把
+        仍在正常生成的任务判成僵尸重派 → 上游重复出片、重复扣额度。"""
+        try:
+            _update_bg(task_id, last_poll_at=time.time())
+        except Exception:
+            pass
+
+    try:
+        res = await doubao.generate_video(
+            prompt, ratio=ratio, duration=duration, model=model_cn,
+            image_paths=reference_images or None,
+            max_attempts=VIDEO_MAX_ATTEMPTS or 0,
+            deadline=deadline, on_poll=_beat)
+    except Exception as exc:
+        await _update(task_id, status="failed",
+                      error=f"{type(exc).__name__}: {exc}"[:500],
+                      finished_at=time.time())
+        return
+    await _update(task_id, status="completed",
+                  video_url=res.get("video_url", ""),
+                  conversation_id=res.get("conversation_id", ""),
+                  account=res.get("account", ""),
+                  finished_at=time.time())
 
 
 @app.get("/v1/videos/{task_id}", response_model=TaskResponse)
@@ -1516,7 +1695,15 @@ async def health():
         "available": pool.available,
         "pending_tasks": store.pending_task_count(),
         "max_pending_tasks": config.MAX_PENDING_TASKS,
+        # 2026-10-15 渠道改造：窗口嗅探器实时状态（窗口是否开着、探测次数、命中窗口数）
+        "window": pool.window_state(),
     }
+
+
+@app.get("/api/admin/window")
+async def admin_window():
+    """窗口嗅探器状态（诊断用）：开着/关着、探测次数、命中窗口数、最近窗口时刻。"""
+    return pool.window_state()
 
 
 # ===== 管理面板 API =====
@@ -1728,6 +1915,218 @@ class VideoPoolBody(BaseModel):
     watch_hours: float = Field(2.0, ge=0.5, le=6)  # 单号出片守望上限（小时）
     proxy: str = ""                # 留空 = socks5://127.0.0.1:7897
     domain: str = ""               # 邮箱域；留空 = mailto.plus（可选 fexpost.com 等）
+
+
+class PoolEngineParams(BaseModel):
+    """出片引擎参数（pool_engine_service → run_pool.py 的 I794_* 环境变量）。
+
+    全部可选；留空的项用引擎内建默认值。字段名与 pool_engine_service.PARAM_ENV 对齐。
+    """
+    pool_target: int | None = Field(None, ge=1, le=500)      # 爆发池保持可用号数
+    max_per_acc: int | None = Field(None, ge=1, le=10)       # 每号每日出片数
+    probe_standby: int | None = Field(None, ge=1, le=50)     # 探针备用数
+    sniff_period: float | None = Field(None, ge=2, le=60)    # 探针周期（秒）
+    sniff_jitter: float | None = Field(None, ge=0, le=30)
+    burst_conc: int | None = Field(None, ge=1, le=200)       # 爆发并发
+    harvest_workers: int | None = Field(None, ge=1, le=64)
+    harvest_timeout: int | None = Field(None, ge=60, le=86400)   # 单 conv 收割上限（秒）
+    harvest_interval: int | None = Field(None, ge=5, le=1800)
+    register_workers: int | None = Field(None, ge=1, le=32)
+    task_attempts: int | None = Field(None, ge=1, le=20)
+    run_seconds: int | None = Field(None, ge=0, le=86400)    # 0=不限
+    ratio: str | None = None                                  # 16:9 / 9:16 / 1:1 ...
+    duration: int | None = Field(None, ge=5, le=30)
+    model: str | None = None           # seedance_v2.5（30s 必须）/ seedance_v2.0
+    watermark_fallback: str | None = None    # save / retry / fail
+    burst_pats: str | None = None     # 爆发号前缀，逗号分隔
+    probe_pat: str | None = None      # 探针号前缀
+    # ---- 以下不是 I794_* env，而是面板侧策略（引擎启动时由面板消费）----
+    channel: str | None = None        # dola（优先，失败降级豆包）/ doubao（只用豆包）
+    k_max: int | None = Field(None, ge=1, le=50)      # 自适应倍数上限
+    k_min: int | None = Field(None, ge=1, le=20)      # 自适应倍数下限
+    min_pool: int | None = Field(None, ge=1, le=500)  # 号池下限
+    max_pool: int | None = Field(None, ge=0, le=5000) # 号池上限，0=不限
+
+
+# 引擎策略参数的默认值（不落 env，只在本进程用于算号池规模 / 选渠道）
+ENGINE_POLICY_DEFAULTS = {
+    "channel": "dola", "k_max": 20, "k_min": 2, "min_pool": 10, "max_pool": 0,
+}
+ENGINE_SETTINGS_KEY = "engine_params"
+
+
+def _load_engine_params() -> dict:
+    """读已保存的引擎参数（app_settings.engine_params）；无则返回空 dict。"""
+    import sqlite3 as _sq
+    conn = _sq.connect(config.POOL_DB_PATH, timeout=15)
+    try:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS app_settings(k TEXT PRIMARY KEY, v TEXT NOT NULL)")
+        row = conn.execute(
+            "SELECT v FROM app_settings WHERE k=?", (ENGINE_SETTINGS_KEY,)).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return {}
+    try:
+        d = json.loads(row[0])
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_engine_params(d: dict) -> str:
+    """保存引擎参数，返回保存时间字符串。"""
+    import sqlite3 as _sq
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    payload = dict(d or {})
+    payload["_saved_at"] = stamp
+    conn = _sq.connect(config.POOL_DB_PATH, timeout=15)
+    try:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS app_settings(k TEXT PRIMARY KEY, v TEXT NOT NULL)")
+        conn.execute(
+            "INSERT INTO app_settings(k,v) VALUES(?,?) "
+            "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+            (ENGINE_SETTINGS_KEY, json.dumps(payload, ensure_ascii=False)))
+        conn.commit()
+    finally:
+        conn.close()
+    return stamp
+
+
+def _engine_effective_params() -> dict:
+    """引擎内建默认 + 面板策略默认 + 已保存覆盖，合成一份完整参数。"""
+    out = dict(pool_engine_service.DEFAULTS)
+    out.update(ENGINE_POLICY_DEFAULTS)
+    saved = _load_engine_params()
+    for k, v in saved.items():
+        if k.startswith("_"):
+            continue
+        if v not in (None, ""):
+            out[k] = v
+    return out
+
+
+def _split_prompt_blocks(text: str, *, whole: bool = False) -> list[str]:
+    """把提示词文本拆成任务列表。
+
+    为什么不能按行拆：任务提示词天生是多行的 —— 用户会写带分镜时间轴、
+    段落描述、旁白字幕的完整剧本（"0—4秒｜大远景｜宇宙战场\\n宇宙一片死寂…\\n
+    4—9秒｜中景｜…"）。历史实现用 splitlines() 按行拆，结果一段剧本被拆成
+    十几条独立任务，每条只拿到一两行，出来的片子全是碎片（用户提交 1 条 30 秒
+    片，任务列表却多出十几条 5 秒任务）。
+
+    两种调用方式：
+      · ``whole=True``（**创作台提交 / 发起出片**）：整段输入作为**一条**任务，
+        段内换行全部保留。用户在创作台写的就是一部完整片子，不该被拆。
+      · ``whole=False``（**批量出片**，默认）：按「空行分段」拆成多条任务，
+        一段一条；没有空行时退化为一行一条（textarea 一行一条的旧行为不变）。
+
+    两种模式都跳过 # 注释行与纯空白段。
+    """
+    raw = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    if whole:
+        # 整段作为一条任务：只剔注释行与空行，其余原样拼接（保留换行）
+        kept = [ln for ln in raw.split("\n")
+                if ln.strip() and not ln.strip().startswith("#")]
+        s = "\n".join(kept).strip()
+        return [s] if s else []
+
+    if "\n\n" not in raw:
+        # 没有空行 → 一行一条（旧行为，批量出片走这里）
+        out = []
+        for ln in raw.split("\n"):
+            s = ln.strip()
+            if not s or s.startswith("#"):
+                continue
+            out.append(s)
+        return out
+    blocks: list[str] = []
+    for chunk in raw.split("\n\n"):
+        kept = [ln for ln in chunk.split("\n")
+                if ln.strip() and not ln.strip().startswith("#")]
+        if not kept:
+            continue
+        # 段内去掉首尾空行，中间的空行压成一个换行，避免提示词里出现连续空行
+        s = "\n".join(kept).strip()
+        if s:
+            blocks.append(s)
+    return blocks
+
+
+def _compute_pool_target(n_tasks: int, params: dict) -> dict:
+    """按任务量自适应算号池目标（与前端 ecPreview / bgRecount 同一公式）。
+
+    need = ceil(任务数 / 每号出片数)              —— 一个窗口打完的硬需求
+    K    = clamp(round(20 / sqrt(need)), K_MIN, K_MAX)  —— 任务少→高倍冗余，任务多→低倍
+    pool = clamp(ceil(need * K), MIN_POOL, MAX_POOL)    —— MAX_POOL=0 表示不设上限
+
+    为什么这样：pool_target 决定单个窗口能打出去多少条（每号吃 max_per_acc 条）。
+    任务少时放大池子力争一窗清完；任务多时必须收窄，否则注册线程要现场补几百个号
+    （≈15 秒/个、5 并发），补号期间窗口白过，反而更慢。
+    """
+    per = max(1, int(params.get("max_per_acc") or 2))
+    k_max = max(1, int(params.get("k_max") or 20))
+    k_min = max(1, int(params.get("k_min") or 2))
+    min_pool = max(1, int(params.get("min_pool") or 10))
+    max_pool = int(params.get("max_pool") or 0)
+    need = max(1, -(-int(n_tasks) // per))          # ceil 除法
+    k = int(round(20.0 / (need ** 0.5)))
+    k = min(max(k, k_min), k_max)
+    target = max(min_pool, -(-(need * k) // 1))
+    if max_pool > 0:
+        target = min(target, max_pool)
+    return {"need": need, "k": k, "pool_target": int(target),
+            "per": per, "k_min": k_min, "k_max": k_max,
+            "min_pool": min_pool, "max_pool": max_pool}
+
+
+class PoolEngineSubmit(BaseModel):
+    """「批量出片」提交：提示词 + 队列模式 + 可选的本次出片参数覆盖。"""
+    prompts: str = ""
+    mode: str = "append"              # append（追加）/ replace（覆盖）
+    duration: int | None = Field(None, ge=5, le=30)
+    ratio: str | None = None
+    model: str | None = None
+    # ★ 测试/创作台场景：每个任务只用 1 个号（N 个视频 = N 个号，一号一片）。
+    #   默认 None = 沿用「系统设置 · 每号出片数」。
+    one_per_account: bool = False
+    # 本次是否把既有号也算进可派发池（测试场景想尽量用存量号时打开）
+    use_all_accounts: bool = True
+
+
+class PoolDispatchBody(BaseModel):
+    """池级「发起出片」：N 条提示词 → 引擎按探测窗口整池提交。
+
+    与账号级 test-generate 的区别（用户明确要求后者改为走这条链路）：
+      * 不钉死单个账号 —— 从**账号池**里选 N 个号；
+      * 不在这里出片 —— 写进引擎队列，等 710 窗口放开时**同刻提交**；
+      * 某个号这轮没成功 → 任务回队，**下一轮换别的号**再试。
+
+    prompt 支持多行（一行一条提示词）；count = 每条提示词生成几个视频。
+    最终视频数 = 有效行数 × count，也就是要占用的号数（一号一片）。
+    """
+    prompt: str = Field(..., min_length=1)
+    count: int = Field(1, ge=1, le=200)      # 每条提示词生成几个
+    duration: int = Field(30, ge=5, le=30)
+    ratio: str | None = None
+    model: str | None = None
+    reference_images: list[str] = Field(default_factory=list)
+    wait: bool = False                        # True=同步等窗口结果（测试用）；False=立即返回
+    wait_seconds: int = Field(600, ge=30, le=7200)
+
+
+class EngineParamsBody(BaseModel):
+    """保存引擎参数：只提交要改的键；reset=True 时恢复默认。"""
+    params: PoolEngineParams = Field(default_factory=PoolEngineParams)
+    reset: bool = False
+
+
+class PoolEngineStart(BaseModel):
+    """启动出片引擎：提示词（一行一条）+ 参数。"""
+    prompts: str = ""                 # 多行；留空 = 用现有 tasks.txt
+    params: PoolEngineParams = Field(default_factory=PoolEngineParams)
 
 
 class AccountAdd(BaseModel):
@@ -2303,7 +2702,18 @@ async def admin_reset_quotas(x_admin_key: str | None = Header(default=None)):
 
 _GENSET_MODELS = ("seedance-2.0", "seedance-2.5")
 _GENSET_DURATIONS = {("seedance-2.0"): (5, 10, 15), ("seedance-2.5"): (5, 10, 30)}
-_GENSET_RATIOS = ("21:9", "16:9", "4:3", "1:1", "3:4", "9:16")
+# ★ 2026-10-16：比例表补 3:2 / 2:3 / 4:5 / 5:4。
+#   证据：视频侧档位来自网页版真实配置（extensions/dola30/
+#   doubao-skill-pack-response.json 的 ratio.options 只有 6 档，**没有** 3:2 系）；
+#   图片侧参考实现（open-ai-canvas）的豆包图片吸附表更宽，含 3:2/2:3/4:5/5:4。
+#   故**视频用子集**、图片用全集 —— 否则用户"选了 3:2 却出 16:9"，
+#   属于静默不生效（比报错更糟）。
+_GENSET_RATIOS = ("21:9", "16:9", "3:2", "4:3", "1:1",
+                  "4:5", "5:4", "3:4", "2:3", "9:16")
+_GENSET_VIDEO_RATIOS = ("21:9", "16:9", "4:3", "1:1", "3:4", "9:16")
+# Seedream 文生图档位（**没有时长**：出图没有"几秒"这个概念）
+_GENSET_IMAGE_MODELS = ("seedream-4.0", "seedream-4.5",
+                        "seedream-5.0-pro", "seedream-5.0-flash")
 
 # 豆包域的模型/时长档位（网页版 ability_param 口径，与 dola 不同：只到 10 秒）
 _GENSET_MODELS_DOUBAO = ("seedance-2.0", "seedance-2.0-std", "seedance-2.5")
@@ -2365,6 +2775,9 @@ async def admin_get_genset(channel: str = "",
     ch = (channel or "").strip().lower()
 
     def _one(c: str) -> dict:
+        # ★ 「生成设置」页管的是**视频**档位（模型/时长/比例），所以比例给
+        #   视频子集：3:2 系在视频链路上游不生效，列出来会让用户"选了不生效"。
+        #   图片的比例在创作台按模式下发（见 studio/capabilities 的 by_mode）。
         d = _load_genset(c)
         if c == "doubao":
             return {"model": d.get("model") or "seedance-2.0",
@@ -2372,13 +2785,13 @@ async def admin_get_genset(channel: str = "",
                     "ratio": d.get("ratio") or "16:9",
                     "models": list(_GENSET_MODELS_DOUBAO),
                     "durations": {k: list(v) for k, v in _GENSET_DURATIONS_DOUBAO.items()},
-                    "ratios": list(_GENSET_RATIOS)}
+                    "ratios": list(_GENSET_VIDEO_RATIOS)}
         return {"model": d.get("model") or "seedance-2.0",
                 "duration": int(d.get("duration") or 5),
                 "ratio": d.get("ratio") or "16:9",
                 "models": list(_GENSET_MODELS),
                 "durations": {k: list(v) for k, v in _GENSET_DURATIONS.items()},
-                "ratios": list(_GENSET_RATIOS)}
+                "ratios": list(_GENSET_VIDEO_RATIOS)}
 
     if ch in ("dola", "doubao"):
         return {"channel": ch, **_one(ch)}
@@ -2401,8 +2814,10 @@ async def admin_set_genset(body: GenSetBody, channel: str = "",
     if body.duration not in durations.get(body.model, (5, 10, 15, 30)):
         raise HTTPException(
             422, f"{body.model} 的时长仅支持 {durations.get(body.model)}")
-    if body.ratio not in _GENSET_RATIOS:
-        raise HTTPException(422, f"ratio 仅支持 {_GENSET_RATIOS}")
+    # ★ 这里校验**视频**比例子集：本端点保存的是视频生成设置，
+    #   收下 3:2 会存成一个"上游不生效"的档位（静默不生效比报错更糟）。
+    if body.ratio not in _GENSET_VIDEO_RATIOS:
+        raise HTTPException(422, f"ratio 仅支持 {_GENSET_VIDEO_RATIOS}")
     _save_genset({"model": body.model, "duration": body.duration,
                   "ratio": body.ratio}, ch)
     return {"ok": True, "channel": ch, "model": body.model,
@@ -2746,6 +3161,1077 @@ async def admin_videopool_stop(x_admin_key: str | None = Header(default=None)):
     _admin_auth(x_admin_key)
     videopool_mgr.stop()
     return {"ok": True}
+
+
+# ===== 出片引擎（run_pool.py 服务化；链路完全按 A：注册→探针→爆发→收割）=====
+# 说明：这条链路是一个长驻多线程引擎，不在事件循环里重写，而是进程级包装。
+# 面板只管「下发参数 / 看状态 / 看日志 / 看成片」，引擎负责干活。
+
+@app.post("/api/admin/pool-engine/start")
+async def admin_pool_engine_start(body: PoolEngineStart,
+                                  x_admin_key: str | None = Header(default=None)):
+    """启动出片引擎。注意：会先暂停面板自己的窗口嗅探器（避免互抢窗口相位）。
+
+    参数来源：显式传入的 > 「系统设置 · 引擎参数」里保存的 > 引擎内建默认。
+    """
+    _admin_auth(x_admin_key)
+    cfg = body.model_dump()
+    # 过滤掉未填写的参数（保留「用已保存值 / 默认值」的语义）
+    params = {k: v for k, v in (cfg.get("params") or {}).items() if v not in (None, "")}
+    # 没显式传的，用已保存的引擎参数补齐（这样「系统设置」改了才真的生效）
+    if not params:
+        params = _engine_effective_params()
+    else:
+        merged = _engine_effective_params()
+        merged.update(params)
+        params = merged
+    # 清掉可能残留的清空/覆盖哨兵：否则引擎一启动就把队列清了/重装了
+    for _flag in (pool_engine_service.CLEAR_FLAG, pool_engine_service.RELOAD_FLAG):
+        try:
+            _flag.unlink()
+        except (FileNotFoundError, OSError):
+            pass
+    ok, msg = await asyncio.to_thread(
+        poolengine_mgr.start, {"prompts": cfg.get("prompts"), "params": params})
+    if not ok:
+        raise HTTPException(409, msg)
+    return {"ok": True, "message": msg}
+
+
+@app.get("/api/admin/pool-engine/status")
+async def admin_pool_engine_status(log_lines: int = 120,
+                                   x_admin_key: str | None = Header(default=None)):
+    _admin_auth(x_admin_key)
+    return await asyncio.to_thread(poolengine_mgr.status, max(0, min(1000, log_lines)))
+
+
+@app.post("/api/admin/pool-engine/stop")
+async def admin_pool_engine_stop(grace: float = 60.0,
+                                 x_admin_key: str | None = Header(default=None)):
+    """优雅停止：落 STOP 文件让引擎自己收尾（写 summary、收干净在飞的收割）。"""
+    _admin_auth(x_admin_key)
+    ok, msg = await asyncio.to_thread(poolengine_mgr.stop, max(5.0, min(600.0, grace)))
+    return {"ok": ok, "message": msg}
+
+
+@app.get("/api/admin/pool-engine/tasks")
+async def admin_pool_engine_tasks(x_admin_key: str | None = Header(default=None)):
+    """读现有 tasks.txt（提示词队列）。"""
+    _admin_auth(x_admin_key)
+    p = pool_engine_service.TASKS_FILE
+    text = p.read_text(encoding="utf-8", errors="replace") if p.is_file() else ""
+    prompts = [ln for ln in text.splitlines() if ln.strip() and not ln.startswith("#")]
+    return {"text": text, "count": len(prompts)}
+
+
+@app.post("/api/admin/pool-engine/tasks")
+async def admin_pool_engine_tasks_save(body: PoolEngineStart,
+                                       x_admin_key: str | None = Header(default=None)):
+    """保存提示词到 tasks.txt（不启动引擎）。
+
+    ★ 多行提示词必须转义后再写：tasks.txt 是「一行一条」协议，而调用方
+      （面板提示词编辑框）可能提交一整段分镜剧本。直接 splitlines 写入会把
+      一条任务摊成 N 条，用户在任务中心看到的就是「提交 1 条、多出十几行」。
+    """
+    _admin_auth(x_admin_key)
+    prompts = [ln.strip() for ln in (body.prompts or "").splitlines()
+               if ln.strip() and not ln.strip().startswith("#")]
+    if not prompts:
+        raise HTTPException(400, "提示词为空")
+    p = pool_engine_service.TASKS_FILE
+    p.write_text(
+        "\n".join(pool_engine_service.escape_prompt_newlines(x)
+                  for x in prompts) + "\n",
+        encoding="utf-8")
+    return {"ok": True, "count": len(prompts)}
+
+
+# ===== 引擎参数（系统设置 → 引擎参数）=====
+
+@app.get("/api/admin/engine-params")
+async def admin_engine_params(x_admin_key: str | None = Header(default=None)):
+    """读引擎参数：已保存值（params）+ 内建默认（defaults）+ 策略默认。"""
+    _admin_auth(x_admin_key)
+    saved = _load_engine_params()
+    return {
+        "params": _engine_effective_params(),
+        "saved": {k: v for k, v in saved.items() if not k.startswith("_")},
+        "defaults": {**pool_engine_service.DEFAULTS, **ENGINE_POLICY_DEFAULTS},
+        "saved_at": saved.get("_saved_at") or "",
+    }
+
+
+@app.post("/api/admin/engine-params")
+async def admin_engine_params_save(body: EngineParamsBody,
+                                   x_admin_key: str | None = Header(default=None)):
+    """保存引擎参数（下次启动引擎生效）。reset=True 时清空已保存值。"""
+    _admin_auth(x_admin_key)
+    if body.reset:
+        _save_engine_params({})
+        return {"ok": True, "reset": True, "saved_at": _load_engine_params().get("_saved_at", "")}
+    incoming = {k: v for k, v in body.params.model_dump().items() if v not in (None, "")}
+    if not incoming:
+        raise HTTPException(400, "没有要保存的参数")
+    # 与已有值合并（只提交部分字段时不丢其它字段）
+    merged = {k: v for k, v in _load_engine_params().items() if not k.startswith("_")}
+    merged.update(incoming)
+    stamp = _save_engine_params(merged)
+    return {"ok": True, "params": _engine_effective_params(), "saved_at": stamp}
+
+
+# ===== 批量出片（账号管理 → ＋批量出片）=====
+
+@app.post("/api/admin/pool-engine/submit")
+async def admin_pool_engine_submit(body: PoolEngineSubmit,
+                                   x_admin_key: str | None = Header(default=None)):
+    """批量出片：提示词 → 队列；按任务量自适应算号池；引擎没跑就自动启动。
+
+    出片逻辑不变：仍是 run_pool.py 的「探针嗅窗 → 整池爆发 → 收割」。
+    这里只负责入队、算 pool_target、拉起引擎。
+
+    ★ 提示词按「空行分段」拆任务（_split_prompt_blocks）：一行一条的填法
+      行为不变；粘进来的多行分镜剧本会作为**一条**任务整体入队，不会被
+      按行拆成十几条碎片任务。
+    """
+    _admin_auth(x_admin_key)
+    prompts = _split_prompt_blocks(body.prompts or "")
+    if not prompts:
+        raise HTTPException(400, "提示词不能为空")
+    mode = (body.mode or "append").strip().lower()
+    if mode not in ("append", "replace"):
+        raise HTTPException(422, "mode 只能是 append 或 replace")
+
+    p = pool_engine_service.TASKS_FILE
+    mgr = poolengine_mgr
+    engine_running = mgr.running() or bool(mgr._pid_file_running())
+    if mode == "replace":
+        final = list(prompts)
+    else:
+        existing = []
+        if p.is_file():
+            # 读回时还原换行转义：文件里存的是 \n 字面量，直接拿去拼接/去重
+            # 会让「同一段多行提示词」看起来与本次提交不同，从而重复入队。
+            existing = [pool_engine_service.unescape_prompt_newlines(ln.strip())
+                        for ln in p.read_text(encoding="utf-8", errors="replace").splitlines()
+                        if ln.strip() and not ln.strip().startswith("#")]
+        # 追加时按内容去重（保留首次出现顺序），避免重复提交同一批提示词
+        final = list(dict.fromkeys(existing + prompts))
+    # ★ 写入前统一转义换行：tasks.txt 只能一行一条，多行提示词不转义就会被
+    #   按行拆成 N 条独立任务（用户提交 1 条 30 秒片，列表多出十几条碎片）。
+    p.write_text(
+        "\n".join(pool_engine_service.escape_prompt_newlines(x)
+                  for x in final) + "\n",
+        encoding="utf-8")
+    # 覆盖模式：引擎若在跑，必须让它按新文件全量重建队列。
+    # 否则旧 pending 会继续出片、新提示词又被 diff 追加进去 —— "覆盖"会变成"叠加"。
+    # 放在写盘之后：引擎重建时读到的就是新内容。
+    if mode == "replace" and engine_running:
+        ok, rmsg = await asyncio.to_thread(mgr.queue_reload)
+        if not ok:
+            raise HTTPException(409, f"覆盖队列失败：{rmsg}")
+
+    # 引擎参数 = 已保存值；批量出片可按本次覆盖出片参数（时长/比例/模型）
+    params = _engine_effective_params()
+    for k in ("duration", "ratio", "model"):
+        v = getattr(body, k, None)
+        if v not in (None, ""):
+            params[k] = v
+    if body.one_per_account:
+        # 测试/创作台：N 个视频 = N 个号（一号一片），不再一号吃多条
+        params["max_per_acc"] = 1
+    sizing = _compute_pool_target(len(final), params)
+    params["pool_target"] = sizing["pool_target"]
+
+    started = False
+    if engine_running:
+        # 已在跑：run_pool 的队列热加载线程会把新行吃进去，不需要重启
+        msg = "已入队（引擎运行中，热加载接单）"
+    else:
+        ok, msg = await asyncio.to_thread(mgr.start, {"prompts": None, "params": params})
+        if not ok:
+            raise HTTPException(409, f"入队成功但引擎启动失败：{msg}")
+        started = True
+    return {"ok": True, "count": len(final), "added": len(prompts), "mode": mode,
+            "started": started, "message": msg,
+            "need": sizing["need"], "k": sizing["k"],
+            "pool_target": sizing["pool_target"], "per": sizing["per"]}
+
+
+@app.post("/api/admin/pool-engine/dispatch")
+async def admin_pool_engine_dispatch(body: PoolDispatchBody,
+                                     x_admin_key: str | None = Header(default=None)):
+    """池级「发起出片」：N 个视频 → N 个号 → 等窗口同刻提交 → 失败换号重来。
+
+    与账号级 test-generate 的分工（用户明确要求后者改为走这条链路）：
+      * **不钉死账号**：任务进全局队列，任何可用号都能接；
+      * **不立刻出片**：等 710 窗口放开时整池同刻提交（引擎的 probe/burst 机制）；
+      * **失败换号**：某号这轮没成功 → note_tried 记下 → 任务回队，
+        下一窗 take_next(avoid=...) 优先换别的号（run_pool 内已实现）。
+
+    count 个视频 = count 条任务、每条只用 1 个号（one_per_account），
+    所以「生成几个视频就选几个号」严格成立。
+    """
+    _admin_auth(x_admin_key)
+    # ★ whole=True：整段输入作为**一条**任务。「发起出片」的提示词框里粘的
+    #   往往是完整分镜剧本（多行、带时间轴），按行/按段拆都会把一部片子拆成
+    #   碎片 —— 用户要的是「这几个视频各用几个号」，不是「一行一个视频」。
+    #   段内换行由 submit_tasks 转义成 \n 字面量单行存储，读出来再还原。
+    lines = _split_prompt_blocks(body.prompt or "", whole=True)
+    if not lines:
+        raise HTTPException(400, "提示词不能为空")
+    count = max(1, int(body.count or 1))
+    # 视频数 = 有效提示词条数 × 每条份数；每条任务占 1 个号（一号一片）
+    prompts = [ln for ln in lines for _ in range(count)]
+    n_tasks = len(prompts)
+    batch = uuid.uuid4().hex[:8]
+    task_ids = ["poolgen_%s_%03d" % (batch, i + 1) for i in range(n_tasks)]
+
+    p = pool_engine_service.TASKS_FILE
+    mgr = poolengine_mgr
+    engine_running = mgr.running() or bool(mgr._pid_file_running())
+    existing = 0
+    if p.is_file():
+        existing = sum(1 for ln in p.read_text(encoding="utf-8", errors="replace").splitlines()
+                       if ln.strip() and not ln.strip().startswith("#"))
+    # 追加语义：创作台/测试不该清掉用户已有的批量队列。
+    # ★ 给这批任务加优先标记（prio=True）：否则它们排在几百条批量任务之后，
+    #   要等好几个出片窗口才轮到 —— 用户点完「发起出片」半天没动静，看起来像坏了。
+    # ★ 必须走 submit_tasks 成对写 tasks.txt + tasks.meta.jsonl：旧代码只写
+    #   tasks.txt，meta 条数对不上时引擎的 load_tasks() 会**拒绝启动**
+    #   （实测把队列搞成 1 条 vs 103 条，连点三次全军覆没）。
+    r = await asyncio.to_thread(
+        mgr.submit_tasks,
+        [{"prompt": x, "meta": {}} for x in prompts],
+        mode="append", prio=True)
+    if not r.get("ok"):
+        raise HTTPException(400, r.get("error") or "入队失败")
+
+    params = _engine_effective_params()
+    params["max_per_acc"] = 1          # ★ 一号一片：N 个视频用 N 个号
+    # ★ 「发起出片」是等窗口语义：引擎必须常驻到窗口放开（几分钟~几十分钟）。
+    #   run_seconds 一旦非 0，引擎会在时限到达时主动收尾退出，任务永远等不到
+    #   窗口（实测 run_seconds=25 → 25 秒后 [STOP]，队列原样躺着）。
+    params["run_seconds"] = 0
+    for k, v in (("duration", body.duration), ("ratio", body.ratio), ("model", body.model)):
+        if v not in (None, ""):
+            params[k] = v
+    # 池规模：够本次这批用即可（创作台是即时小批量，不必按整队列放大）
+    k_safe = max(1, min(int(params.get("k_max") or 20), 3))
+    params["pool_target"] = max(1, n_tasks * k_safe)
+
+    started = False
+    if engine_running:
+        msg = "已入队（引擎运行中，窗口放开即提交）"
+    else:
+        ok, msg = await asyncio.to_thread(mgr.start, {"prompts": None, "params": params})
+        if not ok:
+            raise HTTPException(409, f"任务已入队但引擎启动失败：{msg}")
+        started = True
+
+    result = {
+        "ok": True, "count": n_tasks, "prompts": len(lines), "per_prompt": count,
+        "task_ids": task_ids, "started": started, "message": msg,
+        "pool_target": params["pool_target"], "max_per_acc": 1,
+        "queue_count": r.get("count") or (existing + n_tasks),
+        "mode": "window_burst",       # 明确告知前端：走的是探测窗口+整池提交
+    }
+    if not body.wait:
+        return result
+
+    # 同步等待（测试/脚本用）：轮询队列快照，等这批任务都到终态
+    deadline = time.time() + int(body.wait_seconds)
+    base = existing
+    want_tids = {"t%03d" % (base + i + 1) for i in range(n_tasks)}
+    final_rows: list[dict] = []
+    while time.time() < deadline:
+        await asyncio.sleep(3)
+        snap = await asyncio.to_thread(mgr.read_queue_state)
+        rows = {r.get("tid"): r for r in (snap.get("rows") or [])}
+        final_rows = list(rows.values())
+        pending = [r for r in final_rows
+                   if r.get("status") in ("pending", "flying")]
+        if not pending:
+            break
+    done = [r for r in final_rows if r.get("tid") in want_tids]
+    accts = sorted({str(r.get("account")) for r in done if r.get("account")})
+    result.update({
+        "waited": True,
+        "done": len([r for r in done if r.get("status") in
+                     ("done", "done_watermarked", "failed")]),
+        "succeeded": sum(1 for r in done if str(r.get("status", "")).startswith("done")),
+        "failed": sum(1 for r in done if r.get("status") == "failed"),
+        # 用了几个号 = 「N 个视频就选几个号」是否成立的直接证据
+        "accounts_used": accts, "accounts_used_count": len(accts),
+        "rows": [{"tid": r.get("tid"), "status": r.get("status"),
+                  "account": r.get("account")} for r in done],
+    })
+    return result
+
+
+# ===== 队列（运行状态 → 队列面板）=====
+
+@app.get("/api/admin/pool-engine/queue")
+async def admin_pool_engine_queue(x_admin_key: str | None = Header(default=None)):
+    """当前队列（只读）。
+
+    数据源优先级：
+      1) 引擎内存快照（out/queue_state.json，且够新鲜）—— 最权威；
+      2) 引擎没跑 / 快照过期 → 用**台账**算（ledger.jsonl 里受理/收割/失败事件），
+         再叠加 tasks.txt 里还没开工的行。
+    为什么需要第 2 条：只按 tasks.txt 反推会把「已受理但还没出片」的任务
+    也算成 pending —— 实测面板显示 pending 102，而台账是 97 pending + 1 accepted，
+    两个数字对不上，用户会以为队列卡了。
+    """
+    _admin_auth(x_admin_key)
+    snap = await asyncio.to_thread(poolengine_mgr.read_queue_state)
+    rows = snap.get("rows") or []
+    stale = bool(snap.get("stale"))
+    source = "engine_snapshot"
+    if stale:
+        # 快照过期/不存在 → 用台账合成。合成成功就不该再显示"过期"，
+        # 但 source 要如实标成 ledger（用户能看出这不是引擎实时快照）。
+        merged = await asyncio.to_thread(_queue_rows_from_ledger)
+        if merged:
+            rows, stale, source = merged, False, "ledger"
+    # 队列面板把「在飞 / 待处理」排前面，其余按 tid 顺序
+    order = {"flying": 0, "pending": 1, "accepted": 2, "failed": 3,
+             "done_watermarked": 4, "done": 5, "cancelled": 6}
+    rows = sorted(rows, key=lambda x: (order.get(x.get("status"), 9), str(x.get("tid"))))
+    counts: dict[str, int] = {"pending": 0, "accepted": 0, "done": 0, "failed": 0}
+    for r in rows:
+        s = str(r.get("status") or "pending")
+        key = "done" if s.startswith("done") else s
+        if key in counts:
+            counts[key] += 1
+        else:
+            counts[key] = counts.get(key, 0) + 1
+    return {"ok": True, "count": len(rows), "counts": counts,
+            "rows": rows[:300],
+            "generated_at": snap.get("generated_at") or "",
+            "stale": stale, "source": source}
+
+
+def _queue_rows_from_ledger() -> list[dict]:
+    """引擎没跑时，用 tasks.txt + ledger 事件合成队列行（尽量与 /status 一致）。"""
+    rows: list[dict] = []
+    n = 0
+    # 1) tasks.txt 里所有有效行（先按行号给 tid；带优先标记的标 prio）
+    try:
+        for raw in pool_engine_service.TASKS_FILE.read_text(
+                encoding="utf-8", errors="replace").splitlines():
+            s = raw.strip()
+            if not s or s.startswith("#"):
+                continue
+            prio = s.startswith(pool_engine_service.PRIO_MARK)
+            if prio:
+                s = s[len(pool_engine_service.PRIO_MARK):].strip()
+                if not s:
+                    continue
+            # 多行提示词还原成真换行：面板上看到的与用户输入一致
+            s = pool_engine_service.unescape_prompt_newlines(s)
+            n += 1
+            rows.append({"tid": "t%03d" % n, "status": "pending", "account": "",
+                         "conv": "", "attempts": 0, "mp4": "", "prompt": s,
+                         "prio": prio})
+    except OSError:
+        return []
+    by_tid = {r["tid"]: r for r in rows}
+
+    # 2) 用台账事件覆盖状态（只认与这些 tid 对应的）
+    def _idx(tid) -> str:
+        try:
+            return "t%03d" % int(str(tid).lstrip("t"))
+        except (TypeError, ValueError):
+            return str(tid)
+
+    try:
+        tail = pool_engine_service.LEDGER.read_text(
+            encoding="utf-8", errors="replace").splitlines()[-8000:]
+    except OSError:
+        tail = []
+    for line in tail:
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        tid = _idx(ev.get("task") or "")
+        row = by_tid.get(tid)
+        if row is None:
+            continue
+        k = ev.get("kind")
+        if k == "accepted":
+            row["status"] = "accepted"
+            row["account"] = ev.get("account") or row["account"]
+            row["conv"] = str(ev.get("conv") or row["conv"])
+        elif k == "task_failed":
+            row["status"] = "failed"
+        elif k == "harvest" and ev.get("ftypisom"):
+            row["status"] = "done_watermarked" if not ev.get("unwatermarked") else "done"
+            row["account"] = ev.get("account") or row["account"]
+    # 3) 磁盘成片是"完成"的最终权威（引擎可能来不及写 harvest 事件）
+    try:
+        for p in Path(pool_engine_service.MP4DIR).glob("*.mp4"):
+            row = by_tid.get(_idx(p.stem.split("_")[0]))
+            if row is not None:
+                row["status"] = "done_watermarked" if p.stem.endswith("_WM") else "done"
+    except OSError:
+        pass
+    return rows
+
+
+@app.post("/api/admin/pool-engine/queue/clear")
+async def admin_pool_engine_queue_clear(x_admin_key: str | None = Header(default=None)):
+    """清空队列：只清尚未开工的 pending，已受理 / 在收割的不打断。"""
+    _admin_auth(x_admin_key)
+    ok, msg, cleared = await asyncio.to_thread(poolengine_mgr.queue_clear)
+    if not ok:
+        raise HTTPException(409, msg)
+    return {"ok": True, "cleared": cleared, "message": msg}
+
+
+# ===== 创作台 =====
+# 创作台的提交目标是**出片引擎**（run_pool.py 的队列），不是面板的 _run_task 路径：
+# 引擎才有「探针嗅窗 → 整池爆发 → 延迟收割」这条已验证的出片链路。
+# 参考素材（用户在素材库 @ 引用的图片）经 asset_store 解析成本地路径，
+# 随任务写进 tasks.meta.jsonl，最终由 dola_window 上传到上游。
+
+
+class StudioGenerateBody(BaseModel):
+    mode: str = "video"                 # video | image
+    channel: str = "dola"               # dola | doubao
+    prompt: str = Field(..., min_length=1)
+    asset_ids: list[str] = Field(default_factory=list)
+    model: str | None = None
+    duration: int | None = None
+    ratio: str | None = None
+
+
+@app.get("/api/admin/studio/capabilities")
+async def admin_studio_capabilities(x_admin_key: str | None = Header(default=None)):
+    """按渠道/模式下发可用模型、时长档、比例、参考图上限（前端据此禁用无效项）。
+
+    dola 与豆包的档位本来就不同（见 _GENSET_* 两套表），创作台必须按渠道给，
+    否则用户选了豆包渠道的 30 秒 + seedance-2.0 会被上游拒。
+    """
+    _admin_auth(x_admin_key)
+
+    def _one(ch: str, mode: str) -> dict:
+        """某个渠道在某个模式下的档位。
+
+        ★ 模式差异必须在这里表达，前端才能"按模式给正确选项"：
+          · **图片**：模型是 Seedream 四档、**没有时长**（出图没有秒数概念）、
+            比例用全集（含 3:2 / 2:3）；
+          · **视频**：模型是 Seedance、有时长、比例用视频子集（3:2 系不生效）。
+        """
+        if mode == "image":
+            # 目前只有豆包域有 Seedream 生图通道；dola 域没有图片能力。
+            if ch != "doubao":
+                return {"models": [], "durations": {}, "ratios": [],
+                        "max_reference_images": 0, "modes": ["video"],
+                        "image_supported": False}
+            return {"models": list(_GENSET_IMAGE_MODELS),
+                    "durations": {},          # ★ 图片没有时长
+                    "ratios": list(_GENSET_RATIOS),
+                    "max_reference_images": int(config.REFERENCE_IMAGE_MAX_COUNT),
+                    "modes": ["image"], "image_supported": True}
+        if ch == "doubao":
+            models, durations = _GENSET_MODELS_DOUBAO, _GENSET_DURATIONS_DOUBAO
+        else:
+            models, durations = _GENSET_MODELS, _GENSET_DURATIONS
+        return {"models": list(models),
+                "durations": {k: list(v) for k, v in durations.items()},
+                "ratios": list(_GENSET_VIDEO_RATIOS),
+                # 与 media.REFERENCE_IMAGE_MAX_COUNT 对齐（上游 dola 最多 10 张）
+                "max_reference_images": int(config.REFERENCE_IMAGE_MAX_COUNT),
+                "modes": ["image", "video"] if ch == "doubao" else ["video"],
+                "image_supported": ch == "doubao"}
+
+    # 结构：{渠道: {模式: 档位}}。保留旧的顶层扁平字段（第一次调用时的视频档位）
+    # 做向后兼容，老前端/第三方脚本不会被这次改动打断。
+    out: dict = {}
+    for _ch in ("dola", "doubao"):
+        out[_ch] = {"video": _one(_ch, "video"), "image": _one(_ch, "image")}
+    legacy = {ch: dict(out[ch]["video"]) for ch in out}
+    return {**legacy, "by_mode": out}
+
+
+@app.get("/api/admin/studio/engine")
+async def admin_studio_engine(x_admin_key: str | None = Header(default=None)):
+    """引擎当前状态（创作台顶部提示条用）。"""
+    _admin_auth(x_admin_key)
+    running = bool(poolengine_mgr.running() or poolengine_mgr._pid_file_running())
+    snap = await asyncio.to_thread(poolengine_mgr.read_queue_state)
+    counts = snap.get("counts") or {}
+    rows = list(snap.get("rows") or [])
+    # 队列里出现过的渠道（用于提交前校验「同队列不混渠道」）
+    channels = sorted({str(r.get("channel") or "dola") for r in rows})
+    # ★ 图片/视频是**两条并行车道**，互不阻塞，所以"队列占用"要按车道分开看：
+    #   队列里只有视频时，提交图片**不应该**被"同队列不混渠道"拦住。
+    rows_video = [r for r in rows if str(r.get("kind") or "video") != "image"]
+    rows_image = [r for r in rows if str(r.get("kind") or "video") == "image"]
+    return {"running": running,
+            "pending": int(counts.get("pending") or 0),
+            "accepted": int(counts.get("accepted") or 0),
+            "done": int(counts.get("done") or 0),
+            "failed": int(counts.get("failed") or 0),
+            "channels": channels,
+            "lanes": {
+                "video": {"count": len(rows_video),
+                          "channels": sorted({str(r.get("channel") or "dola")
+                                              for r in rows_video})},
+                "image": {"count": len(rows_image),
+                          "channels": sorted({str(r.get("channel") or "dola")
+                                              for r in rows_image})},
+            }}
+
+
+@app.post("/api/admin/studio/generate")
+async def admin_studio_generate(body: StudioGenerateBody,
+                                x_admin_key: str | None = Header(default=None)):
+    """创作台提交：解析素材 → 入队到出片引擎（带结构化参数）。
+
+    ★ 素材解析在这里完成：asset_ids → 本地绝对路径 → tasks.meta.jsonl。
+      引擎启动时把这些路径**预上传到上游**（dola_window.prefetch_assets），
+      窗口一开只发最后一个 POST —— 这就是「引用素材真正同步提交给上游」。
+    """
+    _admin_auth(x_admin_key)
+    mode = (body.mode or "video").strip().lower()
+    if mode not in ("video", "image"):
+        raise HTTPException(422, "mode 只能是 video 或 image")
+    channel = (body.channel or "dola").strip().lower()
+    if channel not in ("dola", "doubao"):
+        raise HTTPException(422, "channel 只能是 dola 或 doubao")
+    if len(body.prompt) > config.MAX_PROMPT_CHARS:
+        raise HTTPException(422, f"提示词过长（上限 {config.MAX_PROMPT_CHARS} 字符）")
+
+    # ---- 1) 解析引用素材 ----
+    asset_paths: list[str] = []
+    asset_names: list[str] = []
+    if body.asset_ids:
+        if len(body.asset_ids) > config.REFERENCE_IMAGE_MAX_COUNT:
+            raise HTTPException(
+                422, f"参考图最多 {config.REFERENCE_IMAGE_MAX_COUNT} 张"
+                     f"（收到 {len(body.asset_ids)} 张）")
+        try:
+            paths, missing = await asyncio.to_thread(
+                asset_store.resolve_paths, body.asset_ids)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        if missing:
+            raise HTTPException(
+                422, f"有 {len(missing)} 个素材不存在或已被删除：{', '.join(missing[:5])}")
+        asset_paths = paths
+        for aid in body.asset_ids:
+            asset = await asyncio.to_thread(asset_store.get_asset, aid)
+            if asset:
+                asset_names.append(str(asset.get("name") or aid))
+
+    # ---- 2) 同队列不混渠道 ----
+    # dola 与豆包的限流语义相反（dola=全局窗口、豆包=账号级），混在一个队列里
+    # 会让两种调度纪律互相破坏（方案文档 §1.4）。
+    # ★ 2026-10-16：这条约束**按车道（kind）分别判**。
+    #   图片与视频是 run_pool 里两条并行的派发线程（doubao / doubao-img），
+    #   互不阻塞；若仍按"整队列一把判"，用户就没法"图片和视频同时生成"——
+    #   提交图片会被队列里的视频任务 409 拦住（正是用户截图里的报错）。
+    snap = await asyncio.to_thread(poolengine_mgr.read_queue_state)
+    lane_rows = [r for r in (snap.get("rows") or [])
+                 if str(r.get("kind") or "video") == mode]
+    existing_channels = {str(r.get("channel") or "dola") for r in lane_rows}
+    existing_channels.discard("")
+    if existing_channels and existing_channels != {channel}:
+        _lane_label = "图片" if mode == "image" else "视频"
+        raise HTTPException(
+            409, "队列里已有「%s」渠道的%s任务，同一车道内两种渠道的调度方式不同，"
+                 "不能混排。请先清空该车道的任务，或改用 %s 渠道。"
+                 "（图片与视频是两条并行车道，互不影响）"
+                 % ("、".join(sorted(existing_channels)), _lane_label,
+                    "、".join(sorted(existing_channels))))
+
+    # ★ 图片只有豆包域有通道（Seedream）；dola 域没有生图能力，早失败胜过静默不出图。
+    if mode == "image" and channel != "doubao":
+        raise HTTPException(
+            422, "图片生成（Seedream）目前只支持「豆包」渠道，请把渠道切到豆包。")
+
+    # ---- 3) 入队 ----
+    meta = {
+        "asset_paths": asset_paths,
+        "asset_ids": list(body.asset_ids or []),
+        "asset_names": asset_names,
+        "ratio": body.ratio or "",
+        "duration": body.duration,
+        "model": body.model or "",
+        "channel": channel,
+        "kind": mode,
+    }
+    result = await asyncio.to_thread(
+        poolengine_mgr.submit_tasks,
+        [{"prompt": body.prompt, "meta": meta}], mode="append")
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("error") or "入队失败")
+
+    # 素材被引用过：登记关系（供"这条成片用了哪些素材"与「再次生成」）
+    if body.asset_ids and result.get("added"):
+        for aid in body.asset_ids:
+            await asyncio.to_thread(asset_store.link_refs, "", aid)
+
+    # ---- 4) 引擎没在跑就自动启动 ----
+    # 创作台界面上写的是"引擎未运行 —— 提交后会自动启动"，这里必须兑现：
+    # 否则任务躺在队列里没人管，用户看不到任何报错，只是"不出片"。
+    # 复用面板的启动端点逻辑（含嗅探器互斥、STOP 清理、参数合并）。
+    started, start_msg = False, ""
+    if not result.get("engine_running"):
+        try:
+            for _flag in (pool_engine_service.CLEAR_FLAG,
+                          pool_engine_service.RELOAD_FLAG):
+                try:
+                    _flag.unlink()
+                except (FileNotFoundError, OSError):
+                    pass
+            ok, msg = await asyncio.to_thread(
+                poolengine_mgr.start,
+                {"prompts": None, "params": _engine_effective_params()})
+            started = bool(ok)
+            start_msg = msg
+            if not ok:
+                # 启动失败不阻断入队结果：任务已在队列里，引擎下次起来会跑
+                print(f"[studio] 入队成功但引擎启动失败: {msg}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[studio] 自动启动引擎异常: {exc!r}", flush=True)
+
+    return {"ok": True, "tid": None, "kind": mode, "channel": channel,
+            "queued": result.get("added") or 0,
+            "queue_count": result.get("count") or 0,
+            "engine_running": bool(result.get("engine_running")) or started,
+            "engine_started": started,
+            "asset_count": len(asset_paths),
+            "message": (result.get("message") or "")
+                       + (("；" + start_msg) if started else "")}
+
+
+@app.get("/api/admin/studio/feed")
+async def admin_studio_feed(limit: int = 60,
+                            x_admin_key: str | None = Header(default=None)):
+    """创作台时间线：合并引擎台账（ledger.jsonl）与队列快照。
+
+    数据源与引擎自己的看板（A 的 monitor.py）同源 —— 每受理/爆发/收割都立刻
+    落台账，所以"刚提交就能看到"，不必等 summary_pool.json（它只在引擎退出时写）。
+    """
+    _admin_auth(x_admin_key)
+    limit = max(1, min(int(limit or 60), 200))
+    engine_state = await asyncio.to_thread(poolengine_mgr.running) or \
+        bool(poolengine_mgr._pid_file_running())
+
+    snap = await asyncio.to_thread(poolengine_mgr.read_queue_state)
+    queue_rows = {str(r.get("tid")): r for r in (snap.get("rows") or [])}
+
+    # 台账：按 task 聚合最近事件
+    latest: dict[str, dict] = {}
+    try:
+        lines = pool_engine_service.LEDGER.read_text(
+            encoding="utf-8", errors="replace").splitlines()[-6000:]
+        for raw in lines:
+            try:
+                ev = json.loads(raw)
+            except Exception:
+                continue
+            tid = str(ev.get("task") or "")
+            if not tid or tid == "(bonus)":
+                continue
+            prev = latest.setdefault(tid, {})
+            # ★ 注意：台账事件里的 "kind" 是**事件名**（harvest/accepted/…），
+            #   不是产物类型。产物类型由图片车道写在 `kind_` 上，必须分开取，
+            #   否则把事件名当成产物类型，前端会把图片当视频渲染。
+            ev_kind = ev.get("kind")
+            if str(ev.get("kind_") or "") in ("image", "video"):
+                prev["kind"] = str(ev["kind_"])
+            prev["id"] = tid
+            prev.setdefault("prompt", ev.get("prompt") or "")
+            prev["channel"] = ev.get("channel") or prev.get("channel") or ""
+            prev["ratio"] = ev.get("ratio") or prev.get("ratio") or ""
+            prev["duration"] = ev.get("duration") or prev.get("duration") or None
+            prev["model"] = ev.get("model") or prev.get("model") or ""
+            prev["account"] = ev.get("account") or prev.get("account") or ""
+            prev["conv"] = ev.get("conv") or prev.get("conv") or ""
+            prev["asset_names"] = ev.get("asset_names") or prev.get("asset_names") or []
+            if ev.get("created_ts"):
+                prev["created_at"] = float(ev["created_ts"])
+            else:
+                prev.setdefault("created_at", _now_epoch(ev.get("tstr")))
+            if ev_kind == "accepted":
+                prev["status"] = "accepted"
+            elif ev_kind == "submit_retry":
+                prev["status"] = "retrying"
+            elif ev_kind == "task_failed":
+                prev["status"] = "failed"
+                # ★ 失败原因码（如 DOUBAO_NEED_MANUAL_CONFIRM / DOUBAO_POLL_TIMEOUT）：
+                #   前端据此给出"该干什么"的提示，而不是只显示一个失败。
+                prev["last_outcome"] = str(ev.get("last_outcome")
+                                           or ev.get("reason") or "")
+                if ev.get("hint"):
+                    prev["hint"] = str(ev.get("hint"))[:300]
+                if not prev.get("error"):
+                    prev["error"] = str(ev.get("last_outcome")
+                                        or ev.get("reason") or "")[:200]
+            elif ev_kind == "harvest":
+                # ★ 完成判定要分渠道：
+                #   dola  → 看 ftypisom（引擎会校验落盘的 MP4 是否完整）
+                #   豆包  → 车道只写 status="succeeded" + local_path，没有 ftypisom
+                #           （豆包域不判水印、也不做 ftyp 校验）
+                # 若统一要求 ftypisom，豆包的成功会被误显示成"失败"。
+                if ev.get("status") == "succeeded" or ev.get("ftypisom"):
+                    prev["status"] = "completed"
+                    prev["unwatermarked"] = bool(ev.get("unwatermarked"))
+                    lp = str(ev.get("local_path") or "")
+                    if lp:
+                        # ★ 图片产物发到 /engine-img（与视频的 /engine-mp4 分开）：
+                        #   前端图片卡片要直接 <img>，混在 mp4 目录里既认不出也扫不对。
+                        _is_img = (str(ev.get("kind_") or "") == "image"
+                                   or Path(lp).suffix.lower()
+                                   in (".png", ".jpg", ".jpeg", ".webp"))
+                        if _is_img:
+                            prev["kind"] = "image"
+                            urls = [f"{config.PUBLIC_BASE}/engine-img/{Path(p).name}"
+                                    for p in (ev.get("local_paths") or [lp])]
+                            prev["image_urls"] = urls
+                            prev["image_url"] = urls[0] if urls else ""
+                            prev["image_count"] = int(ev.get("image_count")
+                                                      or len(urls))
+                        else:
+                            prev["kind"] = "video"
+                            prev["video_url"] = (
+                                f"{config.PUBLIC_BASE}/engine-mp4/{Path(lp).name}")
+                            prev["video_size"] = ev.get("bytes")
+                else:
+                    prev["status"] = "failed"
+                    prev["error"] = str(ev.get("failure_reasons")
+                                        or ev.get("exc") or "")[:200]
+    except OSError:
+        pass
+
+    items = list(latest.values())
+    # 队列里还没有台账记录的（刚入队）也补上，保证"提交即可见"
+    for tid, row in queue_rows.items():
+        if tid in latest:
+            continue
+        items.append({
+            "id": tid, "status": str(row.get("status") or "pending"),
+            "prompt": row.get("prompt") or "",
+            "channel": row.get("channel") or "dola",
+            "kind": str(row.get("kind") or "video"),
+            "ratio": row.get("ratio") or "", "duration": row.get("duration"),
+            "model": row.get("model") or "",
+            "asset_names": row.get("asset_names") or [],
+            "account": row.get("account") or "",
+        })
+    # 用户删除过的记录不再出现在时间线（ledger 追加写、删不掉，只能过滤）
+    hidden = await asyncio.to_thread(_studio_hidden_read)
+    if hidden:
+        items = [x for x in items if str(x.get("id") or "") not in hidden]
+    # 磁盘成片是"完成"的最终权威证据（引擎可能来不及写 harvest 事件）
+    for item in items:
+        if item.get("status") != "completed":
+            continue
+        is_img = str(item.get("kind") or "") == "image"
+        if is_img and not item.get("image_urls"):
+            # 图片任务一条是**多张**产物：全扫出来（序号有序），不能只取第一张。
+            imgs = sorted(pool_engine_service.IMGDIR.glob(f"{item['id']}_*"),
+                          key=lambda p: p.name)
+            if imgs:
+                urls = [f"{config.PUBLIC_BASE}/engine-img/{p.name}" for p in imgs]
+                item["image_urls"] = urls
+                item["image_url"] = urls[0]
+                item["image_count"] = len(urls)
+        elif not is_img and not item.get("video_url"):
+            mp4 = pool_engine_service.MP4DIR.glob(f"{item['id']}_*.mp4")
+            for cand in sorted(mp4, key=lambda p: p.stat().st_mtime, reverse=True)[:1]:
+                item["video_url"] = (f"{config.PUBLIC_BASE}/engine-mp4/"
+                                     f"{cand.name}")
+    # 失败原因翻成大白话（原始技术报错留在 error_raw 里，排查时还能看）
+    for item in items:
+        if item.get("status") != "failed":
+            continue
+        if item.get("error"):
+            item["error_raw"] = str(item["error"])[:300]
+        why = studio_failure_text(item)
+        if why:
+            item["error"] = why
+    items.sort(key=lambda x: float(x.get("created_at") or 0), reverse=True)
+    counts = snap.get("counts") or {}
+    return {"items": items[:limit], "total": len(items),
+            "engine": {"running": bool(engine_state),
+                       "pending": int(counts.get("pending") or 0),
+                       "channel": (sorted({str(r.get("channel") or "dola")
+                                           for r in (snap.get("rows") or [])}) or ["dola"])[0]}}
+
+
+def _now_epoch(tstr: str | None) -> float:
+    """把台账里的 'YYYY-MM-DD HH:MM:SS' 转成 epoch 秒；失败返回 0。"""
+    if not tstr:
+        return 0.0
+    try:
+        import datetime as _dt
+        return _dt.datetime.strptime(str(tstr), "%Y-%m-%d %H:%M:%S").timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+# ===== 创作台：被用户删除的记录（持久化隐藏）=====
+# ledger.jsonl 是引擎**追加写**的，删不掉；而成片 MP4 删了也只是"没片可播"，
+# 那条记录下次刷新还会回来。所以删除必须落一份"已隐藏 tid"清单，
+# 让 feed 侧过滤掉 —— 否则用户点完删除，刷新一下失败卡片又冒出来。
+# 数据量极小（最多几百个 tid），直接一个 JSON 文件，不引入新库。
+STUDIO_HIDDEN_FILE = pool_engine_service.OUT / "studio_hidden.json"
+
+
+# ---- 失败原因的白话化 ----
+# 引擎/协议层的报错是给开发看的（`RuntimeError('socks5 connect rejected code=1')`、
+# `DOUBAO_NEED_MANUAL_CONFIRM`、`HTTPConnectionPool(...)`…），运营看不懂也不知道
+# 该干什么。这里按关键词归类成「一句原因 + 一句建议」，规则顺序即优先级。
+# 前端也有一份同款规则（web/index.html 的 STUDIO_ERR_RULES），两边口径保持一致；
+# 后端先翻一遍，前端再兜底，保证任何来源的失败记录都能显示中文。
+STUDIO_FAILURE_RULES: tuple[tuple[re.Pattern[str], str, str], ...] = (
+    # 注意：这里**不能**匹配裸 "timeout" —— `DOUBAO_POLL_TIMEOUT`（轮询超时）
+    # 是另一类失败（会话已建、只是等太久），必须落在下面专门那条规则上。
+    # 只认 ConnectTimeout / timed out 这种明确的连接层超时。
+    (re.compile(r"socks5|proxy|ConnectTimeout|Max retries exceeded|ConnectionError|"
+                r"ECONNRESET|timed?\s*out|network", re.I),
+     "网络不通：代理线路或上游连接超时/被拒，成片没能取回来。",
+     "换个代理节点或稍后重试；连续失败就更换该线路。"),
+    (re.compile(r"710022002|访问频繁|限流|rate\s*limit|throttl", re.I),
+     "被上游限流：这个账号请求太频繁，暂时不能出片。",
+     "等 10 分钟左右再提交，别连续反复重试（越撞越久）。"),
+    (re.compile(r"710022004|风控|risk\s*control", re.I),
+     "触发上游风控：账号被临时盯上，短时间不能再出片。",
+     "停一段时间再用；必要时换账号。"),
+    (re.compile(r"登录失效|未登录|401|403|凭证|cookie|session|login", re.I),
+     "账号登录状态失效：凭证过期或掉线。",
+     "重新登录该账号，或换一个可用账号。"),
+    (re.compile(r"额度|quota|credit|次数|免费数量用完|今日次数", re.I),
+     "账号额度用完了：今天的免费出片次数已耗尽。",
+     "等次日刷新额度，或换有额度的账号。"),
+    (re.compile(r"肖像保护|未认证人脸|人脸认证|肖像权", re.I),
+     "上游拒绝：参考图涉及肖像保护（未认证人脸不能用来出片）。",
+     "换一张不涉及人脸的参考图，或改用纯文字描述。"),
+    (re.compile(r"侵权|版权|盗用|未授权使用|知识产权", re.I),
+     "上游拒绝：涉嫌侵权/版权问题。",
+     "更换原创素材，避免使用他人作品或名人形象。"),
+    (re.compile(r"审核|不合规|违规|违反社区|敏感|涉黄|暴力|政治|擦边", re.I),
+     "上游拒绝：提示词或参考图内容审核不合规。",
+     "修改提示词描述，或更换参考图后再试。"),
+    (re.compile(r"参考图|更换参考图|换张参考图|上传的图片", re.I),
+     "上游拒绝：参考图不符合要求。",
+     "更换参考图后重试。"),
+    (re.compile(r"授权|确认生成|manual|NEED_MANUAL_CONFIRM|button_block|10103", re.I),
+     "需要人工确认：该账号要在豆包 App 里点一次「确认生成」。",
+     "去豆包 App 点一次授权后，再回来重新提交。"),
+    (re.compile(r"轮询超时|poll_timeout|POLL_TIMEOUT", re.I),
+     "等太久了：上游出片超过等待时间，任务已中断。",
+     "重新提交一次；反复超时就换账号。"),
+    (re.compile(r"下载失败|download_fail|DOWNLOAD_FAIL|坏片|ftyp", re.I),
+     "成片下载失败或文件损坏，没能保存下来。",
+     "重新提交一次；不行就换账号出片。"),
+    (re.compile(r"没有视频|no_video|NO_VIDEO|no_video_in_window", re.I),
+     "这个出片窗口里没拿到成片（上游没出片或窗口已关）。",
+     "等下一个出片窗口，或重新提交。"),
+    (re.compile(r"窗口关闭|WINDOW_CLOSED|window", re.I),
+     "出片窗口已关闭，任务没能提交上去。",
+     "稍后重新提交，或等引擎自动排到下一个窗口。"),
+    (re.compile(r"没有任务|任务不存在|找不到|not\s*found|404", re.I),
+     "任务记录找不到了（可能已被清理）。",
+     "重新提交一次。"),
+    (re.compile(r"env_hit|环境|attempts|重试次数|超过上限", re.I),
+     "重试次数已用完：连续多次都没出片，任务被判定失败。",
+     "稍后重新提交；连续失败就换个时间段或换渠道。"),
+)
+
+
+def studio_failure_text(item: dict) -> str:
+    """把一条失败记录的技术报错翻成大白话；认不出来时返回空串（前端兜底）。
+
+    引擎已经给过中文 hint 的（如素材授权、轮询超时）直接采用，不再套规则。
+    """
+    hint = str(item.get("hint") or "").strip()
+    if len(hint) > 6 and re.search(r"[一-龥]", hint):
+        return hint
+    text = " ".join(str(item.get(k) or "").strip()
+                    for k in ("error", "last_outcome", "reason", "exc"))
+    text = text.strip()
+    if not text:
+        return ""
+    for pattern, why, fix in STUDIO_FAILURE_RULES:
+        if pattern.search(text):
+            return f"{why}\n建议：{fix}"
+    return ""
+
+
+def _studio_hidden_read() -> set[str]:
+    try:
+        data = json.loads(STUDIO_HIDDEN_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    items = data.get("hidden") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return set()
+    return {str(t).strip() for t in items if str(t).strip()}
+
+
+def _studio_hidden_write(tids: set[str]) -> None:
+    """原子写（tmp + replace）：写一半崩了也不会留下坏 JSON。"""
+    tmp = STUDIO_HIDDEN_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({"hidden": sorted(tids)}, ensure_ascii=False,
+                              indent=0), encoding="utf-8")
+    os.replace(tmp, STUDIO_HIDDEN_FILE)
+
+
+@app.delete("/api/admin/studio/tasks/{tid}")
+async def admin_studio_task_delete(tid: str,
+                                   x_admin_key: str | None = Header(default=None)):
+    """删除创作台的一条生成记录：删成片文件 + 记入隐藏清单（刷新不再出现）。
+
+    失败记录没有成片文件，但同样要从时间线上消失 —— 靠隐藏清单实现。
+    """
+    _admin_auth(x_admin_key)
+    safe = str(tid).strip()
+    if not safe.startswith("t"):
+        raise HTTPException(422, "非法任务号")
+    # 删成片（引擎 out/mp4/<tid>_*.mp4）与生成图片（out/img/<tid>_*）
+    removed = 0
+    for cand in list(pool_engine_service.MP4DIR.glob(f"{safe}_*.mp4")) + \
+            list(pool_engine_service.IMGDIR.glob(f"{safe}_*")):
+        try:
+            await asyncio.to_thread(cand.unlink)
+            removed += 1
+        except OSError:
+            continue
+    # 记入隐藏清单（ledger 是追加写、删不掉，只能在前端侧过滤）
+    def _mark() -> None:
+        hidden = _studio_hidden_read()
+        hidden.add(safe)
+        _studio_hidden_write(hidden)
+
+    try:
+        await asyncio.to_thread(_mark)
+    except OSError:
+        pass
+    return {"ok": True, "removed": removed}
+
+
+@app.post("/api/admin/studio/regenerate")
+async def admin_studio_regenerate(body: dict,
+                                  x_admin_key: str | None = Header(default=None)):
+    """再次生成：按原任务的参数（含引用的素材）重新入队。"""
+    _admin_auth(x_admin_key)
+    task_id = str((body or {}).get("task_id") or "").strip()
+    if not task_id:
+        raise HTTPException(422, "task_id 不能为空")
+
+    snap = await asyncio.to_thread(poolengine_mgr.read_queue_state)
+    row = next((r for r in (snap.get("rows") or [])
+                if str(r.get("tid")) == task_id), None)
+    if row is None:
+        raise HTTPException(404, "队列里找不到该任务（已收割的任务请从素材库取成片）")
+
+    meta = {
+        "asset_paths": list(row.get("asset_paths") or []),
+        "asset_ids": list(row.get("asset_ids") or []),
+        "asset_names": list(row.get("asset_names") or []),
+        "ratio": row.get("ratio") or "",
+        "duration": row.get("duration"),
+        "model": row.get("model") or "",
+        "channel": row.get("channel") or "dola",
+        "kind": row.get("kind") or "video",
+    }
+    # asset_paths 在队列快照里不落盘（只落数量与名字），这里用素材名回查 id 时
+    # 需要素材库仍在；拿不到就按无参考图重新入队，并如实告知。
+    if meta["asset_names"] and not meta["asset_paths"]:
+        names = set(meta["asset_names"])
+        found = await asyncio.to_thread(asset_store.list_assets, limit=200)
+        by_name = {str(a.get("name")): a for a in (found.get("assets") or [])}
+        paths, ids = [], []
+        for name in meta["asset_names"]:
+            asset = by_name.get(name)
+            if asset:
+                try:
+                    paths.append(str(asset_store.abs_path(asset["rel_path"])))
+                except ValueError:
+                    continue
+                ids.append(asset["id"])
+        meta["asset_paths"], meta["asset_ids"] = paths, ids
+        meta["asset_names"] = [n for n in meta["asset_names"] if n in names or True]
+
+    result = await asyncio.to_thread(
+        poolengine_mgr.submit_tasks,
+        [{"prompt": str(row.get("prompt") or ""), "meta": meta}], mode="append")
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("error") or "入队失败")
+    return {"ok": True, "queued": result.get("added") or 0,
+            "asset_count": len(meta["asset_paths"]),
+            "message": result.get("message") or ""}
+
+
+# ===== 豆包降级（dola 引擎没出片的兜底）=====
+# 引擎是纯 dola 协议的独立进程，不认识豆包库；降级放在面板进程里做，
+# 用现成的 doubao_pool / store，互不干扰，还能单独开关。
+
+async def _fb_create_task(task_id: str, *, model: str, prompt: str, ratio: str,
+                          duration: int, channel: str) -> None:
+    """降级器建任务行（关键字传参，避免误写 account 字段）。"""
+    await asyncio.to_thread(store.create, task_id, model, prompt, ratio, duration,
+                            channel=channel)
+
+
+async def _fb_update_task(task_id: str, **fields) -> None:
+    await asyncio.to_thread(store.update, task_id, **fields)
+
+
+_FALLBACK = engine_fallback.DoubaoFallback(
+    doubao, _fb_create_task, _fb_update_task,
+    log=lambda m: print(m, flush=True))
+
+
+def _fallback_enabled() -> bool:
+    return os.environ.get("DOLA_ENGINE_FALLBACK", "1").strip().lower() not in ("0", "false", "no")
+
+
+async def _run_doubao_fallback(reason: str = "") -> dict:
+    """把引擎未出片的任务交给豆包（串行跑，放线程里避免冻事件循环）。"""
+    if not _fallback_enabled():
+        return {"skipped": True, "reason": "DOLA_ENGINE_FALLBACK=0 已关闭"}
+    if _FALLBACK.running:
+        return {"skipped": True, "reason": "降级任务进行中"}
+    summary = await asyncio.to_thread(poolengine_mgr.read_summary)
+    eff = _engine_effective_params()
+    # 豆包侧模型串是**下划线**（与引擎的 seedance_v2.5 同口径，但档位更少）
+    fb_model = os.environ.get("DOLA_FALLBACK_MODEL", "seedance_v2.0")
+    fb_duration = min(10, int(eff.get("duration") or 10))
+    fb_ratio = eff.get("ratio") or "16:9"
+    if reason:
+        print(f"[fallback] 触发降级（{reason}）", flush=True)
+    return await asyncio.to_thread(
+        _FALLBACK.run, summary, model=fb_model, ratio=fb_ratio,
+        duration=fb_duration, max_items=int(os.environ.get("DOLA_FALLBACK_MAX", "20")))
+
+
+@app.get("/api/admin/pool-engine/fallback")
+async def admin_pool_engine_fallback_state(x_admin_key: str | None = Header(default=None)):
+    """降级器状态（是否在跑、上一轮成功/失败）。"""
+    _admin_auth(x_admin_key)
+    st = _FALLBACK.state()
+    st["enabled"] = _fallback_enabled()
+    st["model"] = os.environ.get("DOLA_FALLBACK_MODEL", "seedance_v2.0")
+    return st
+
+
+@app.post("/api/admin/pool-engine/fallback")
+async def admin_pool_engine_fallback_run(x_admin_key: str | None = Header(default=None)):
+    """手动触发一次豆包降级（把引擎 summary 里 failed 的任务跑一遍）。"""
+    _admin_auth(x_admin_key)
+    res = await _run_doubao_fallback("手动触发")
+    if res.get("skipped"):
+        return {"ok": True, "skipped": True, "message": res.get("reason") or "无需降级"}
+    return {"ok": True, "total": res.get("total"), "succeeded": res.get("ok"),
+            "failed": res.get("failed"),
+            "message": f"降级完成：成功 {res.get('ok',0)} / 失败 {res.get('failed',0)}"}
 
 
 @app.post("/api/admin/accounts/import-cookies")
@@ -3872,13 +5358,151 @@ async def admin_doubao_test_gen_status(task_id: str,
 @app.get("/api/admin/tasks")
 async def admin_tasks(limit: int = 50, channel: str = "",
                       x_admin_key: str | None = Header(default=None)):
-    """任务中心：可按渠道筛选（channel=dola|doubao，留空=全部）。"""
+    """任务中心：可按渠道筛选（channel=dola|doubao，留空=全部）。
+
+    ★ 数据源 = tasks.db **加** 引擎队列（run_pool 的 tasks.txt / queue_state.json）。
+      引擎链路（批量出片 / 发起出片 / 创作台提交）不写 tasks.db —— 它有自己的
+      队列与台账。只看 tasks.db 的话，新提交的任务要等**成片后**才出现在这里
+      （_sync_engine_tasks_to_db 只落终态），期间用户在任务中心看不到任何东西，
+      表现为「创建了任务但任务中心不刷新」。所以这里把引擎队列实时合并进来。
+    """
     _admin_auth(x_admin_key)
     ch = (channel or "").strip().lower()
     rows = await asyncio.to_thread(
         store.recent_tasks, min(max(limit, 1), 200),
         None, ch if ch in ("dola", "doubao") else None)
-    return {"tasks": rows, "channel": ch or "all"}
+
+    engine_rows = await asyncio.to_thread(_engine_queue_task_rows, ch)
+    # 引擎已完成的任务在 tasks.db 里已有 eng_<tid>_<conv>.mp4 记录（带视频链接）——
+    # 同一部片不要出现两行。
+    # ★ 去重必须**按 conv 精确匹配**，不能按 tid 前缀：
+    #   · tid 是队列行号（t001…），队列被清空/覆盖后会**重排复用**。上一轮跑完的
+    #     eng_t001_38418355.mp4 还在库里，新一轮排队中的 eng_t001 是另一条任务，
+    #     按 tid 前缀判重会把"刚提交、正在排队"的任务**误杀**——任务中心一片空白，
+    #     用户以为提交失败（实测：点完「发起出片」列表里什么都没有）。
+    #   · 只有"同一个 tid 且同一个 conv 已经成片入库"才算重复。排队/生成中的行
+    #     没有 conv，永远不会被误判。
+    existing = {str(r.get("id") or "") for r in rows}
+    existing_convs = {c for x in existing for c in (_conv_from_eng_id(x) and [_conv_from_eng_id(x)]) or []}
+    for er in engine_rows:
+        tid = str(er.get("id") or "")
+        conv = str(er.get("conversation_id") or "")
+        # 终态（已成片）且 conv 能对上库内记录 → 同一条，跳过
+        if conv and conv in existing_convs:
+            continue
+        rows.append(er)
+    rows.sort(key=lambda r: float(r.get("created_at") or 0), reverse=True)
+    return {"tasks": rows[:max(1, min(limit, 200))], "channel": ch or "all",
+            "engine_rows": len(engine_rows)}
+
+
+# 引擎队列状态 → 任务中心状态（任务中心的 status 语义见 loadTasks 的 sb 表）
+_ENGINE_STATUS_MAP = {
+    "pending": "queued",
+    "flying": "processing",
+    "accepted": "processing",
+    "done": "completed",
+    "failed": "failed",
+    "cancelled": "failed",
+}
+
+
+def _conv_from_eng_id(task_id: str) -> str:
+    """从库内引擎任务 id `eng_<tid>_<conv>.mp4` 里取出 conv 号。
+
+    同一 conv 号在全库唯一对应一次会话（run_pool 收割时用它做文件名），
+    所以它才是"这条任务已经成片入库"的可靠凭证；tid 会随队列重排复用，不能用作判重键。
+    取不到（id 形如 eng_xxx.mp4 但中间没有 conv）时返回空串。
+    """
+    s = str(task_id or "")
+    if not s.startswith(ENGINE_TASK_PREFIX):
+        return ""
+    stem = s[len(ENGINE_TASK_PREFIX):]
+    if "." in stem:
+        stem = stem.rsplit(".", 1)[0]
+    parts = stem.split("_")
+    # eng_<tid>_<conv>：tid 形如 t001（1 个 token），conv 是其后第一个纯数字 token
+    if len(parts) >= 2 and parts[0].startswith("t") and parts[0][1:].isdigit() \
+            and parts[1].isdigit():
+        return parts[1]
+    return ""
+
+
+def _engine_queue_task_rows(channel: str = "") -> list[dict]:
+    """把引擎队列快照转成任务中心可直接渲染的行（只读，不写库）。
+
+    为什么不写 tasks.db：这些行是引擎的**活队列**，写进去会被看门狗当成
+    「排队超时/孤儿任务」重派或判失败，反而搅乱引擎自己的队列调度
+    （见 _sync_engine_tasks_to_db 的注释）。所以只在读取时合并展示。
+
+    id 用 `eng_<tid>`（tid = t001 这种）。已完成的任务在 tasks.db 里的 id 是
+    `eng_<文件名>`，调用方按 startswith 去重。
+    """
+    try:
+        snap = poolengine_mgr.read_queue_state()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[tasks] 引擎队列读取失败（已忽略）: {exc}", flush=True)
+        return []
+    rows_in = snap.get("rows") or []
+    now = time.time()
+    out: list[dict] = []
+    for r in rows_in:
+        tid = str(r.get("tid") or "")
+        if not tid:
+            continue
+        row_ch = str(r.get("channel") or "dola")
+        if channel and channel != row_ch:
+            continue
+        status = _ENGINE_STATUS_MAP.get(str(r.get("status") or "pending"), "queued")
+        # created_at 必须稳定：前端 loadTasks 用 JSON 指纹做「数据没变就跳过重建」的
+        # 短路，这里如果每次都用 time.time()，指纹永远在变 → 每 10 秒重建整表。
+        # 引擎的 pending 行没有真实创建时间，取快照生成时间（够细，且同状态内稳定）；
+        # 快照没有 generated_at（停机反推）时退化到 tasks.txt 的 mtime。
+        created = _now_epoch(snap.get("generated_at"))
+        if not created:
+            try:
+                created = pool_engine_service.TASKS_FILE.stat().st_mtime
+            except OSError:
+                created = now
+        item = {
+            "id": ENGINE_TASK_PREFIX + tid,
+            "model": r.get("model") or "",
+            "prompt": r.get("prompt") or "",
+            "ratio": r.get("ratio") or "",
+            "duration": r.get("duration") or None,
+            "status": status,
+            # 队列行的"创建时刻"是**没有真实来源**的：引擎的 pending/flying 行不带
+            # 创建时间，只能借快照 generated_at（引擎每 3 秒重写一次 → 值一直在跳），
+            # 或退化到 tasks.txt 的 mtime。之前把这个值当 created_at 交给前端，于是
+            # 「已等 X 分」显示的是"tasks.txt 上次被写入距今多久"，与排队时长无关，
+            # 而且快照一刷新就跳变。这里如实标记为不可信，由前端显示「—」。
+            "created_at_trusted": False,
+            "account": r.get("account") or "",
+            "conversation_id": r.get("conv") or "",
+            "channel": row_ch,
+            "video_url": "",
+            "api_key_name": "",
+            "reference_images": "[]",
+            "reference_thumbs": "[]",
+            "attempted_accounts": "",
+            "failure_code": "",
+            "error": "",
+            "eta_text": "",
+            "started_at": None,
+            "finished_at": None,
+            "last_poll_at": 0,
+            "client_concurrency_limit": 0,
+            "created_at": created,
+            "updated_at": created,
+            "source": "engine-queue",   # 前端据此显示「引擎队列」来源标记
+            "attempts": r.get("attempts") or 0,
+            "asset_count": r.get("asset_count") or 0,
+            "prio": bool(r.get("prio")),
+        }
+        if status == "failed":
+            item["error"] = "引擎侧任务失败（详见运行状态日志）"
+        out.append(item)
+    return out
 
 
 @app.delete("/api/admin/tasks/{task_id}")
@@ -3949,6 +5573,329 @@ async def admin_video_delete(task_id: str, x_admin_key: str | None = Header(defa
     await asyncio.to_thread(_delete_task_files, row)
     await asyncio.to_thread(store.delete_task, task_id)
     return {"ok": True, "deleted": task_id}
+
+
+# ===== 查看视频：合并两个来源 =====
+# 来源 A：引擎探测出片 out/mp4/（channel=dola，只读聚合）
+# 来源 B：面板 / 测试生成 / API 出片（downloads/，走任务库）
+# 合并成一张表，前端按 channel / 水印 筛选。
+
+# 引擎成片同步进任务库时用的 id 前缀。作用有两个：
+#   1) 让「任务中心」也能看到引擎出的片（引擎本身不碰 tasks.db）；
+#   2) 便于「查看视频」去重 —— 同一部片不要既按 out/mp4 又按任务库出现两次。
+ENGINE_TASK_PREFIX = "eng_"
+
+
+def _sync_engine_tasks_to_db() -> int:
+    """把 out/mp4 的引擎成片 upsert 进 tasks.db（终态 completed，看门狗不会动它）。
+
+    只写**已成片**的记录：引擎队列里的 pending/flying 是临时态，写进任务库会被
+    看门狗当成"孤儿任务"重派，反而把引擎的队列搅乱。所以这里只落终态。
+    返回本次新增条数。
+
+    ★ created_at 必须显式落**真实出片时刻**（台账 harvest 的落盘时刻，退化到文件
+      mtime）。用默认的 time.time() 只能得到"入库这一刻" —— 一次同步写进来的十几条
+      成片 created_at 完全相等（实测 11 条都是 1792167354.157），任务中心「创建时间」
+      整列显示同一个 00:15，与真实出片时间（14:26~23:50）完全脱钩，用户看到的就是
+      "时间跟视频对不上"。
+    """
+    rows = _engine_video_rows()
+    added = 0
+    for v in rows:
+        name = str(v.get("id", "")).replace("eng:", "")
+        if not name:
+            continue
+        tid = ENGINE_TASK_PREFIX + name
+        started, finished = v.get("started_at"), v.get("finished_at")
+        # 出片时刻：台账 harvest 落盘时刻优先，退化到 mp4 的 mtime
+        born = float(v.get("created_at") or 0) or float(finished or 0) or time.time()
+        try:
+            if store.get(tid):
+                # 已存在：只补可能后到的字段（例如台账后写的 account/提示词）
+                store.update(tid, video_url=v.get("video_url"),
+                             account=v.get("account") or None,
+                             video_size=v.get("file_size"))
+                _heal_engine_timestamps(tid, started, finished)
+                _heal_engine_created_at(tid, born)
+                continue
+            store.create(tid, v.get("model") or "seedance_v2.5",
+                         v.get("prompt") or "", v.get("ratio") or "16:9",
+                         int(v.get("duration") or 30), account=v.get("account") or None,
+                         channel="dola", created_at=born)
+            store.update(tid, status="completed", video_url=v.get("video_url"),
+                         video_size=v.get("file_size"),
+                         conversation_id=v.get("conversation_id") or None,
+                         started_at=started,
+                         finished_at=finished)
+            added += 1
+        except Exception as exc:  # noqa: BLE001
+            print(f"[engine-sync] {tid} 写入任务库失败: {exc}", flush=True)
+    return added
+
+
+def _heal_engine_created_at(tid: str, born: float) -> None:
+    """就地纠正引擎库行的 created_at（老行修复）。
+
+    背景：这批行是 _sync_engine_tasks_to_db 早先写进去的，created_at 全是"同步那一
+    刻"（十几条一模一样），任务中心「创建时间」列因此毫无信息量。台账里其实有真实
+    落盘时刻，这里在每次同步时幂等地回填，用户不用手工删库重灌。
+
+    判据：created_at 与 finished_at 明显不等（说明是"入库时刻"而不是出片时刻）且
+    台账给了可信的 born 时，才改写。同批次同步写进去的行连 created_at 都相等，这里
+    按"与 finished 不符"逐个纠正，不做整批特判。
+    """
+    if not born or born <= 0:
+        return
+    try:
+        row = store.get(tid)
+    except Exception:  # noqa: BLE001
+        return
+    if not row:
+        return
+    cur = float(row.get("created_at") or 0)
+    if abs(cur - float(born)) < 1.0:
+        return                      # 已经是对的（或在 1 秒误差内）：幂等返回
+    fin = float(row.get("finished_at") or 0)
+    # 只在"当前值明显不是出片时刻"时改写：cur 与 finished 不符才动手，
+    # 避免把其它链路（面板出片）正常写入的 created_at 覆盖掉。
+    if fin and abs(cur - fin) < 1.0:
+        return
+    try:
+        store.update(tid, created_at=float(born))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[engine-sync] {tid} 创建时刻修复失败: {exc}", flush=True)
+
+
+def _heal_engine_timestamps(tid: str, started, finished) -> None:
+    """就地纠正引擎库行的时刻（老行修复；台账认不出时刻时保持原样）。
+
+    背景：这批行是 _sync_engine_tasks_to_db 早先写进去的，started_at 与 finished_at
+    都被填成了文件 mtime（两值相等）→ 面板耗时恒为 0M。台账里其实有真实受理/成片
+    时刻，这里在每次同步时幂等地把它们回填，用户不用手工删库重灌。
+
+    只改「明显是错的」行：两值相等（同一 mtime）或为空，且台账给了可信时刻。
+    已经是真实耗时的行不动，避免覆盖正常数据。
+    """
+    if not started or not finished:
+        return
+    try:
+        row = store.get(tid)
+    except Exception:  # noqa: BLE001
+        return
+    if not row:
+        return
+    cur_s, cur_f = row.get("started_at") or 0, row.get("finished_at") or 0
+    same = bool(cur_s) and abs(float(cur_s) - float(cur_f)) < 0.001
+    if not (same or not cur_s or not cur_f):
+        return
+    if abs(float(cur_s or 0) - float(started)) < 0.001 \
+            and abs(float(cur_f or 0) - float(finished)) < 0.001:
+        return
+    try:
+        store.update(tid, started_at=started, finished_at=finished)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[engine-sync] {tid} 时刻修复失败: {exc}", flush=True)
+
+
+def _engine_video_rows() -> list[dict]:
+    """把引擎出片目录 + 台账合成面板能直接渲染的行。
+
+    元数据优先级：ledger 的 harvest 记录（有 account / bytes / 无水印判定 / conv）
+    → 退化到「文件名 + 大小 + mtime」。台账缺记录时不造假，如实留空。
+    """
+    rows: list[dict] = []
+    mp4 = Path(pool_engine_service.MP4DIR)
+    if not mp4.is_dir():
+        return rows
+    # 台账：文件名 → 权威元数据（含提示词与**真实时刻**）。
+    # 提示词优先取台账（收割/受理时随任务一起写的），只有老台账没这个字段时，
+    # 才回退到「按 tasks.txt 行号反查」——因为队列清空/覆盖后 tid 会重排
+    # （t001 → t105 …），行号映射会张冠李戴。
+    #
+    # ★ 耗时也必须取台账：harvest 只写 local_path（文件名），而旧实现让
+    #   _sync_engine_tasks_to_db 拿文件 mtime **同时**当 started_at 与 finished_at，
+    #   两个字段永远相等 → 任务中心「耗时徽标」恒为 0M（用户 2026-10-17 实测反馈）。
+    #   真实时刻在台账里成对存在：accepted（受理，带 conv + tstr）→ harvest（成片落盘）。
+    #   配对键用 conv，**不能**用 tid：tid（t001）每轮重排复用，同一 tid 在台账里有多代记录。
+    meta: dict[str, dict] = {}
+    accepted_by_conv: dict[str, float] = {}
+    try:
+        for line in pool_engine_service.LEDGER.read_text(
+                encoding="utf-8", errors="replace").splitlines()[-8000:]:
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            kind = rec.get("kind")
+            if kind == "accepted":
+                conv = str(rec.get("conv") or "")
+                if conv and conv not in accepted_by_conv:
+                    accepted_by_conv[conv] = _now_epoch(rec.get("tstr"))
+                continue
+            if kind != "harvest":
+                continue
+            lp = rec.get("local_path") or ""
+            if not lp:
+                continue
+            conv = str(rec.get("conv") or "")
+            meta[Path(lp).name] = {
+                "account": rec.get("account") or "",
+                "conv": conv,
+                "tid": rec.get("task") or "",
+                "prompt": rec.get("prompt") or "",
+                "unwatermarked": rec.get("unwatermarked"),
+                # 渠道从台账取：豆包域成片也走这个目录，别一律标 dola
+                "channel": str(rec.get("channel") or "dola"),
+                # 出片参数也从台账取，供「查看视频」按真实值展示（见下方不取 params 的原因）
+                "duration": rec.get("duration"),
+                "ratio": rec.get("ratio") or "",
+                "model": rec.get("model") or "",
+                # 成片落盘时刻（harvest 的 tstr）
+                "finished_at": _now_epoch(rec.get("tstr")),
+            }
+    except OSError:
+        pass
+    # 受理时刻按 conv 回填（harvest 记录本身不重复带 accepted 的 tstr）
+    for m in meta.values():
+        m["accepted_at"] = accepted_by_conv.get(m.get("conv") or "", 0.0)
+    # ★ 这里**故意没有**「按 tasks.txt 行号反查提示词」的兜底映射。
+    #   历史实现是 prompt_by_tid["t%03d" % n] = tasks.txt 第 n 行，用来给"老台账
+    #   prompt 为空"的成片补一个提示词。但 tid 是**每轮重排复用**的（t001→t105…），
+    #   队列一旦被清空/覆盖/换批，行号与 tid 就彻底脱钩 —— 实测同一部片在任务中心
+    #   与视频库显示两个不同的提示词（t002_38418427 一边空、一边"汉服美女在赛博朋克
+    #   的街道跑酷"，而它真实是"无人机缓缓飞过东京雨夜街道…"）。
+    #   本文件写 _engine_queue_task_rows 时已明确「tid 会随队列重排复用，不能用作判重键」，
+    #   同一理由在这里同样成立。台账认领不出提示词时**留空**，绝不猜。
+
+    params = _engine_effective_params()   # noqa: F841  （保留：调用方/后续扩展可能用）
+    for f in sorted(mp4.glob("*.mp4"),
+                    key=lambda x: x.stat().st_mtime, reverse=True)[:500]:
+        try:
+            stt = f.stat()
+        except OSError:
+            continue
+        m = meta.get(f.name) or {}
+        tid = m.get("tid") or f.stem.split("_")[0]
+        watermarked = f.stem.endswith("_WM")
+        # 提示词：只认台账 harvest 记录（权威）。台账没有就留空，让前端显示 —。
+        prompt = m.get("prompt") or ""
+        # 渠道：台账认领的用台账；未认领（老成片）按 dola —— 面板只展示，不伪造
+        channel = m.get("channel") or "dola"
+        # 真实时刻三元组（台账有就用台账，缺则退回 mtime，绝不两个字段填同一个值）：
+        #   accepted_at  受理 → started_at（起算点）
+        #   finished_at  harvest 落盘 → 耗时徽标的终点
+        started_at = m.get("accepted_at") or 0.0
+        finished_at = m.get("finished_at") or 0.0
+        if not finished_at:
+            finished_at = stt.st_mtime
+        if not started_at or started_at > finished_at:
+            # 台账认不出受理时刻（bonus 片 / 老台账）→ 只给终点，起点留空由前端显示 —
+            started_at = 0.0
+        rows.append({
+            "id": "eng:" + f.name,
+            "source": "engine",
+            # 列表排序仍用落盘时刻：没有台账时刻的老片也要有稳定序
+            "created_at": finished_at,
+            "started_at": started_at or None,
+            "finished_at": finished_at,
+            "channel": channel,
+            # 时长/比例/模型**只认台账 harvest 记录**，不取全局 params：
+            # params 是"当前引擎参数"（可随设置随时改），拿它给历史成片标注时长，
+            # 会让同一批 30 秒片在某次改设置后集体变成新值（实测队列行显示 10 秒、
+            # 库里行显示 30 秒）。台账没记就留空。
+            "duration": m.get("duration") or None,
+            "ratio": m.get("ratio") or None,
+            "model": m.get("model") or None,
+            "file_size": stt.st_size,
+            "account": m.get("account") or "",
+            "conversation_id": m.get("conv") or "",
+            "prompt": prompt,
+            "tid": tid,
+            "watermarked": watermarked,
+            "file_exists": True,
+            "video_url": f"{config.PUBLIC_BASE}/engine-mp4/{f.name}",
+        })
+    return rows
+
+
+@app.get("/api/admin/videos/all")
+async def admin_videos_all(limit: int = 300,
+                           x_admin_key: str | None = Header(default=None)):
+    """查看视频：引擎出片（out/mp4）+ 面板出片（downloads）合并列表。
+
+    筛选交给前端（数据量小、交互即时）；这里只负责把两个来源规范化成同一形状。
+    """
+    _admin_auth(x_admin_key)
+    limit = min(max(limit, 1), 1000)
+
+    # 先把引擎成片同步进任务库（幂等 upsert），这样「任务中心」也能看到引擎出的片。
+    # 放在读列表之前：本次请求就能看到同步结果；失败不影响列表（只是任务中心少几条）。
+    try:
+        synced = await asyncio.to_thread(_sync_engine_tasks_to_db)
+        if synced:
+            print(f"[engine-sync] 同步 {synced} 条引擎成片进任务库", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[engine-sync] 同步失败（已忽略）: {exc}", flush=True)
+
+    # ---- 面板来源：已完成任务 ----
+    panel_rows: list[dict] = []
+    try:
+        rows = await asyncio.to_thread(store.recent_tasks, limit, None, None)
+        for r in rows:
+            if r.get("status") != "completed":
+                continue
+            item = dict(r)
+            # 引擎成片的库记录与 out/mp4 是同一部片 → 只保留 out/mp4 那一条，
+            # 否则「查看视频」里同一部片会出现两次（一次本地面板、一次引擎）。
+            if str(item.get("id", "")).startswith(ENGINE_TASK_PREFIX):
+                continue
+            item["source"] = "panel"
+            item["channel"] = item.get("channel") or "dola"
+            if item.get("video_url"):
+                local = Path(config.DOWNLOAD_DIR) / Path(item["video_url"]).name
+                exists = local.exists()
+                item["file_exists"] = exists
+                if exists:
+                    try:
+                        item["file_size"] = os.path.getsize(local)
+                    except OSError:
+                        pass
+            else:
+                item["file_exists"] = False
+            # 引擎不产水印标记，面板来源一律按「无水印」展示（面板链路本就取无水印源）
+            item["watermarked"] = False
+            panel_rows.append(item)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[videos/all] 面板来源读取失败: {exc}", flush=True)
+
+    engine_rows = await asyncio.to_thread(_engine_video_rows)
+    out = engine_rows + panel_rows
+    out.sort(key=lambda x: x.get("created_at") or 0, reverse=True)
+    out = out[:limit]
+    return {
+        "videos": out,
+        "total": len(out),
+        "engine_count": len(engine_rows),
+        "panel_count": len(panel_rows),
+    }
+
+
+@app.delete("/api/admin/videos/engine/{name}")
+async def admin_video_engine_delete(name: str,
+                                    x_admin_key: str | None = Header(default=None)):
+    """删除引擎成片（out/mp4/<name>）。只删文件，不碰任务库（引擎本就不写库）。"""
+    _admin_auth(x_admin_key)
+    safe = Path(name).name                      # 防目录穿越
+    if not safe.endswith(".mp4") or safe != name:
+        raise HTTPException(400, "非法文件名")
+    target = Path(pool_engine_service.MP4DIR) / safe
+    if not target.is_file():
+        raise HTTPException(404, "视频文件不存在")
+    try:
+        await asyncio.to_thread(target.unlink)
+    except OSError as exc:
+        raise HTTPException(500, f"删除失败: {exc}") from exc
+    return {"ok": True, "deleted": safe}
 
 
 @app.get("/api/admin/stats")
@@ -4033,6 +5980,407 @@ async def admin_key_delete(key: str, x_admin_key: str | None = Header(default=No
         raise HTTPException(404, "api key not found")
     await asyncio.to_thread(store.delete_key, key)
     return {"ok": True}
+
+
+# ===== 素材库（创作台）=====
+# 用户素材的长期资产库：上传 / 检索 / 打标 / 软删 / 产物入库 / 被引用查询。
+# 数据层在 asset_store.py（独立 assets.db），本段只做 HTTP 适配与文件校验。
+#
+# ★ 为什么素材不放进 refs/：refs/ 是**临时物化产物**，任务终态会被
+#   cleanup_local_references 删、服务启动会被 sweep_stale_references 清。
+#   素材放 assets/ 且由 media.is_asset_reference 单独识别 → 永不被自动删。
+
+_ASSET_KIND_BY_MIME = (
+    ("image/", asset_store.KIND_IMAGE),
+    ("video/", asset_store.KIND_VIDEO),
+    ("audio/", asset_store.KIND_AUDIO),
+)
+
+
+def _asset_kind_of(filename: str, content_type: str = "") -> str:
+    """按扩展名（优先）与 MIME 推断素材类别。"""
+    ext = Path(str(filename or "")).suffix.lower()
+    if ext in asset_store.IMAGE_EXTS:
+        return asset_store.KIND_IMAGE
+    if ext in asset_store.VIDEO_EXTS:
+        return asset_store.KIND_VIDEO
+    if ext in asset_store.AUDIO_EXTS:
+        return asset_store.KIND_AUDIO
+    for prefix, kind in _ASSET_KIND_BY_MIME:
+        if str(content_type or "").lower().startswith(prefix):
+            return kind
+    return asset_store.KIND_IMAGE
+
+
+def _asset_public(asset: dict) -> dict:
+    """库行 → 前端可直接渲染的形状（URL 用 PUBLIC_BASE 拼，便于反代）。"""
+    if not asset:
+        return {}
+    out = dict(asset)
+    rel = str(out.get("rel_path") or "")
+    if rel:
+        out["url"] = f"{config.PUBLIC_BASE}/assets/{rel}"
+    thumb = out.get("thumb")
+    if thumb:
+        out["thumb_url"] = f"{config.PUBLIC_BASE}/asset-thumbs/{Path(str(thumb)).name}"
+    out["size_text"] = _fmt_bytes(out.get("bytes"))
+    return out
+
+
+def _fmt_bytes(value) -> str:
+    try:
+        n = float(value or 0)
+    except (TypeError, ValueError):
+        return "-"
+    if n <= 0:
+        return "-"
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
+@app.get("/api/admin/assets")
+async def admin_assets(kind: str = "", q: str = "", tag: str = "",
+                       group: str = "", source: str = "", channel: str = "",
+                       include_deleted: bool = False,
+                       limit: int = 100, offset: int = 0,
+                       x_admin_key: str | None = Header(default=None)):
+    """素材列表（网格墙）。过滤在 SQL 层做。"""
+    _admin_auth(x_admin_key)
+    k = (kind or "").strip().lower()
+    data = await asyncio.to_thread(
+        asset_store.list_assets,
+        kind=k if k in asset_store.KINDS else None,
+        q=(q or "").strip() or None,
+        tag=(tag or "").strip() or None,
+        group_name=(group or "").strip() or None,
+        source=(source or "").strip() or None,
+        channel=(channel or "").strip() or None,
+        include_deleted=bool(include_deleted),
+        limit=limit, offset=offset,
+    )
+    data["assets"] = [_asset_public(a) for a in data.get("assets", [])]
+    data["stats"] = await asyncio.to_thread(asset_store.stats)
+    return data
+
+
+@app.get("/api/admin/assets/stats")
+async def admin_assets_stats(x_admin_key: str | None = Header(default=None)):
+    """素材库概览（KPI 卡片）。"""
+    _admin_auth(x_admin_key)
+    return await asyncio.to_thread(asset_store.stats)
+
+
+@app.get("/api/admin/assets/groups")
+async def admin_assets_groups(x_admin_key: str | None = Header(default=None)):
+    """已用分组与标签（供筛选下拉）。"""
+    _admin_auth(x_admin_key)
+
+    def _collect() -> dict:
+        data = asset_store.list_assets(limit=500)
+        groups, tags = set(), set()
+        for item in data.get("assets", []):
+            if item.get("group_name"):
+                groups.add(item["group_name"])
+            for t in item.get("tags") or []:
+                tags.add(str(t))
+        return {"groups": sorted(groups), "tags": sorted(tags)}
+
+    return await asyncio.to_thread(_collect)
+
+
+@app.post("/api/admin/assets/upload")
+async def admin_assets_upload(request: Request,
+                              x_admin_key: str | None = Header(default=None)):
+    """上传素材（multipart，多文件）。
+
+    校验对齐既有口径：扩展名白名单（server._save_uploaded_image 同款）、
+    单文件 ≤ ASSET_UPLOAD_MAX_BYTES、单次 ≤ ASSET_UPLOAD_MAX_COUNT、总量配额。
+    """
+    _admin_auth(x_admin_key)
+    form = await request.form()
+    items = []
+    for key in ("file", "files", "image", "images", "file[]", "files[]"):
+        for item in form.getlist(key):
+            if hasattr(item, "read"):
+                items.append(item)
+    if not items:
+        raise HTTPException(400, "没有收到文件（字段名用 file / files）")
+    if len(items) > config.ASSET_UPLOAD_MAX_COUNT:
+        raise HTTPException(
+            422, f"单次最多上传 {config.ASSET_UPLOAD_MAX_COUNT} 个文件"
+            f"（收到 {len(items)}）")
+
+    tags_raw = str(form.get("tags") or "").strip()
+    tags = [t.strip() for t in tags_raw.split(",") if t.strip()]
+    group_name = str(form.get("group") or "").strip()
+
+    saved, failed = [], []
+    for item in items:
+        filename = getattr(item, "filename", "") or ""
+        try:
+            data = await item.read()
+        except Exception as exc:  # noqa: BLE001
+            failed.append({"name": filename, "error": f"读取失败: {exc}"})
+            continue
+        if not data:
+            failed.append({"name": filename, "error": "空文件"})
+            continue
+        if len(data) > config.ASSET_UPLOAD_MAX_BYTES:
+            failed.append({
+                "name": filename,
+                "error": "超过单文件上限 %.0f MB"
+                         % (config.ASSET_UPLOAD_MAX_BYTES / 1048576)})
+            continue
+        kind = _asset_kind_of(filename, getattr(item, "content_type", ""))
+        if kind == asset_store.KIND_IMAGE:
+            # 图片额外做真实性校验（与 _save_uploaded_image 一致）
+            try:
+                from PIL import Image
+                from io import BytesIO
+                with Image.open(BytesIO(data)) as im:
+                    im.verify()
+            except Exception:
+                failed.append({"name": filename, "error": "不是有效图片"})
+                continue
+        try:
+            asset = await asyncio.to_thread(
+                asset_store.ingest_bytes, data,
+                filename=filename, kind=kind, name=filename,
+                tags=tags, group_name=group_name)
+            saved.append(_asset_public(asset))
+        except ValueError as exc:
+            failed.append({"name": filename, "error": str(exc)})
+        except Exception as exc:  # noqa: BLE001
+            failed.append({"name": filename, "error": f"入库失败: {exc}"})
+    return {"ok": bool(saved), "saved": saved, "failed": failed,
+            "saved_count": len(saved), "failed_count": len(failed),
+            "stats": await asyncio.to_thread(asset_store.stats)}
+
+
+@app.get("/api/admin/assets/{asset_id}")
+async def admin_asset_detail(asset_id: str,
+                             x_admin_key: str | None = Header(default=None)):
+    """素材详情：元数据 + 被哪些任务引用（"这条成片用了哪些素材"反向查询）。"""
+    _admin_auth(x_admin_key)
+    asset = await asyncio.to_thread(asset_store.get_asset, asset_id)
+    if not asset:
+        raise HTTPException(404, "素材不存在")
+    refs = await asyncio.to_thread(asset_store.refs_for_asset, asset_id)
+    out = _asset_public(asset)
+    out["refs"] = refs
+    try:
+        out["file_exists"] = asset_store.abs_path(asset["rel_path"]).is_file()
+    except ValueError:
+        out["file_exists"] = False
+    return out
+
+
+class AssetPatchBody(BaseModel):
+    name: str | None = None
+    tags: list[str] | None = None
+    group: str | None = None
+    note: str | None = None
+
+
+@app.patch("/api/admin/assets/{asset_id}")
+async def admin_asset_patch(asset_id: str, body: AssetPatchBody,
+                            x_admin_key: str | None = Header(default=None)):
+    """改名 / 打标签 / 分组 / 备注。"""
+    _admin_auth(x_admin_key)
+    if not await asyncio.to_thread(asset_store.get_asset, asset_id):
+        raise HTTPException(404, "素材不存在")
+    fields: dict[str, Any] = {}
+    if body.name is not None:
+        fields["name"] = body.name
+    if body.tags is not None:
+        fields["tags"] = [str(t).strip() for t in body.tags if str(t).strip()]
+    if body.group is not None:
+        fields["group_name"] = body.group.strip()
+    if body.note is not None:
+        fields["note"] = body.note
+    asset = await asyncio.to_thread(asset_store.update_asset, asset_id, **fields)
+    return {"ok": True, "asset": _asset_public(asset)}
+
+
+@app.delete("/api/admin/assets/{asset_id}")
+async def admin_asset_delete(asset_id: str, purge: bool = False,
+                             x_admin_key: str | None = Header(default=None)):
+    """删除素材。默认**软删**（文件保留，历史任务仍能显示"素材已删除"）。
+
+    purge=1 时连文件一起删；若仍被任务引用则拒绝（避免抽走历史「再次生成」
+    所依赖的素材）。
+    """
+    _admin_auth(x_admin_key)
+    result = await asyncio.to_thread(asset_store.delete_asset, asset_id, purge=purge)
+    if not result.get("ok"):
+        if result.get("reason") == "not_found":
+            raise HTTPException(404, "素材不存在")
+        if result.get("reason") == "referenced":
+            raise HTTPException(
+                409, "该素材已被 %d 个任务引用，不能硬删除（可先软删除）"
+                     % len(result.get("refs") or []))
+        raise HTTPException(400, "删除失败")
+    return result
+
+
+class AssetBulkBody(BaseModel):
+    ids: list[str] = Field(default_factory=list)
+    tags: list[str] | None = None
+    add_tags: list[str] | None = None
+    group: str | None = None
+    delete: bool = False
+    purge: bool = False
+
+
+@app.post("/api/admin/assets/bulk")
+async def admin_assets_bulk(body: AssetBulkBody,
+                            x_admin_key: str | None = Header(default=None)):
+    """批量：追加标签 / 设置分组 / 批量删除。"""
+    _admin_auth(x_admin_key)
+    ids = [str(i).strip() for i in (body.ids or []) if str(i).strip()]
+    if not ids:
+        raise HTTPException(422, "ids 不能为空")
+
+    if body.delete:
+        purged, soft, blocked = 0, 0, []
+        for aid in ids:
+            res = await asyncio.to_thread(asset_store.delete_asset, aid,
+                                          purge=bool(body.purge))
+            if res.get("ok"):
+                purged += 1 if body.purge else 0
+                soft += 0 if body.purge else 1
+            else:
+                blocked.append(aid)
+        return {"ok": True, "deleted": soft + purged, "purged": purged,
+                "blocked": blocked,
+                "stats": await asyncio.to_thread(asset_store.stats)}
+
+    fields: dict[str, Any] = {}
+    if body.add_tags:
+        # 追加语义：逐个读现有标签再合并（素材量级下开销可忽略）
+        added = 0
+        for aid in ids:
+            asset = await asyncio.to_thread(asset_store.get_asset, aid)
+            if not asset:
+                continue
+            merged = list(dict.fromkeys(
+                [str(t) for t in (asset.get("tags") or [])]
+                + [str(t).strip() for t in body.add_tags if str(t).strip()]))
+            await asyncio.to_thread(asset_store.update_asset, aid, tags=merged)
+            added += 1
+        return {"ok": True, "updated": added, "mode": "add_tags"}
+    if body.tags is not None:
+        fields["tags"] = [str(t).strip() for t in body.tags if str(t).strip()]
+    if body.group is not None:
+        fields["group_name"] = body.group.strip()
+    if not fields:
+        raise HTTPException(422, "没有要更新的字段")
+    n = await asyncio.to_thread(asset_store.bulk_update, ids, **fields)
+    return {"ok": True, "updated": n}
+
+
+class AssetImportGeneratedBody(BaseModel):
+    """把引擎/面板的成片登记为素材（创作台产物自动回流）。"""
+
+    task_id: str
+    path: str | None = None          # 不传则按 task_id 从两个产物目录里找
+    channel: str = ""
+    prompt: str = ""
+    name: str | None = None
+    tags: list[str] = Field(default_factory=list)
+
+
+@app.post("/api/admin/assets/import-generated")
+async def admin_assets_import_generated(body: AssetImportGeneratedBody,
+                                        x_admin_key: str | None = Header(default=None)):
+    """产物入库：把成片复制进 assets/out/ 换取长期保存。
+
+    ★ 为什么要复制而不是索引：downloads/ 有保留期清理（_maintenance，默认 14 天）
+      与体积上限（_prune_downloads），引擎 out/mp4/ 也会被清理。
+      素材库的语义是长期资产，所以必须另存一份。
+    """
+    _admin_auth(x_admin_key)
+    task_id = (body.task_id or "").strip()
+    if not task_id:
+        raise HTTPException(422, "task_id 不能为空")
+
+    src = None
+    if body.path:
+        candidate = Path(body.path)
+        # 只允许从既有的两个产物目录里取，防任意文件入库
+        allowed_roots = [Path(config.DOWNLOAD_DIR).resolve(),
+                         Path(pool_engine_service.MP4DIR).resolve()]
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            resolved = candidate
+        if not any(_under(resolved, root) for root in allowed_roots):
+            raise HTTPException(403, "path 只允许指向出片产物目录")
+        if resolved.is_file():
+            src = resolved
+    if src is None:
+        src = _find_generated_file(task_id)
+    if src is None:
+        raise HTTPException(404, f"找不到 {task_id} 的成片文件")
+
+    # 已入库过就不重复复制（同一任务重复点"入库"是常态）
+    existing = await asyncio.to_thread(_find_asset_by_task, task_id)
+    if existing:
+        return {"ok": True, "deduped": True, "asset": _asset_public(existing)}
+
+    try:
+        asset = await asyncio.to_thread(
+            asset_store.ingest_file, src,
+            source=asset_store.SOURCE_GENERATED,
+            kind=asset_store.KIND_VIDEO,
+            name=body.name or src.name,
+            prompt=body.prompt or "",
+            channel=body.channel or "",
+            tags=body.tags or [],
+            origin_task_id=task_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return {"ok": True, "deduped": False, "asset": _asset_public(asset)}
+
+
+def _under(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _find_generated_file(task_id: str) -> Path | None:
+    """在面板 downloads/ 与引擎 out/mp4/ 里按 task_id 找成片。
+
+    引擎成片命名是 <tid>_<conv8>.mp4（可能带 _WM 后缀），面板任务则是
+    video_url 里的文件名 —— 两种都按前缀匹配。
+    """
+    safe = Path(str(task_id)).name
+    candidates: list[Path] = []
+    for root in (Path(config.DOWNLOAD_DIR), Path(pool_engine_service.MP4DIR)):
+        if not root.is_dir():
+            continue
+        candidates.extend(sorted(root.glob(f"{safe}*.mp4"),
+                                 key=lambda p: p.stat().st_mtime, reverse=True))
+    return candidates[0] if candidates else None
+
+
+def _find_asset_by_task(task_id: str) -> dict | None:
+    """按 origin_task_id 找已入库的产物素材（用于"重复入库"去重）。"""
+    conn = asset_store._connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM assets WHERE origin_task_id=? AND deleted_at IS NULL"
+            " ORDER BY created_at DESC LIMIT 1", (str(task_id),)).fetchone()
+        return asset_store._row(row)
+    finally:
+        conn.close()
 
 
 # 面板单文件前端（放最后，保证上面的路由优先）

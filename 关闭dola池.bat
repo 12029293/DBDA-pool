@@ -4,13 +4,13 @@ setlocal
 rem ============================================
 rem  Close dola pool service (uvicorn)
 rem  Usage:
-rem    关闭dola池.bat          -> kill process listening on port 8002 (default)
-rem    关闭dola池.bat 8003     -> kill process listening on port 8003
-rem    关闭dola池.bat python   -> kill all python.exe processes
+rem    CloseDolaPool.bat        -> kill process listening on port 8019 (default)
+rem    CloseDolaPool.bat 8003   -> kill process listening on port 8003
+rem    CloseDolaPool.bat python -> kill all python.exe processes
 rem ============================================
 
 set "TARGET=%~1"
-if "%TARGET%"=="" set "TARGET=8002"
+if "%TARGET%"=="" set "TARGET=8019"
 
 rem --- If target is a number, treat it as a port ---
 echo %TARGET%| findstr /r "^[0-9][0-9]*$" >nul

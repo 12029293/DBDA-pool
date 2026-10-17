@@ -33,6 +33,11 @@ import urllib.request
 
 _DEBUG = False
 
+# 静态资源是否走本机直连（可由调用方在 start() 前改，或用环境变量关掉）。
+# 见 _STATIC_DOMAINS 的说明：这是浏览器通道里最大的一笔可省流量。
+DIRECT_STATIC = os.environ.get("DOLA_BROWSER_DIRECT_STATIC", "1").strip().lower() \
+    not in ("0", "false", "no", "off")
+
 # IPRocket 网关顶不住并发 CONNECT 握手（Chromium 一次页面加载并发 7+ 条，
 # 实测全部超时）。全局信号量把上游握手串行化；握完进入 relay 阶段就释放。
 _CONNECT_SEM: asyncio.Semaphore | None = None
@@ -45,15 +50,38 @@ _NOISE_DOMAINS = ("google.com", "googleapis.com", "gstatic.com", "doubleclick.ne
                   # 不影响 Dola 页面功能，快拒避免 Chromium 反复重试拖慢加载
                   "yhgfb-cn-static.com", "yhgfb-cn.com", "byteimg.cn", "zjcdn.com")
 
+# 【IPRocket 流量治理 · 2026-10-17】静态资源直连名单。
+# 实测一次 SPA 首屏要拉 3.42 MB 的 JS/CSS（单 chat.js 就 1.84 MB），出片轮询
+# 什么都不干也要先付这笔。Dola 的静态资源走的是自己的对象存储 CDN
+# （*.ciai.com / *.byteimg.com 一类），大陆直连可达、不含任何账号态，
+# 让它们走住宅隧道纯属白烧流量。
+# 注意：这里只放**静态资源域**，www.dola.com 的 API 必须继续走隧道（否则 7100003）。
+_STATIC_DOMAINS = (
+    "ciai.com",              # dola 静态站（chat.*.js / *.css）
+    "byteimg.com",           # 火山图床 / 静态图
+    "bytevcloudapi.com",     # 火山对象存储（参考图上传用的 imagex host）
+    "volccdn.com",
+    "volcengine.com",
+)
 
-def _dbg(msg: str):
-    if _DEBUG:
-        print(f"[fwd {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+# 强制直连（不上游握手）: 静态资源域 + 噪音域
+_DIRECT_DOMAINS = _NOISE_DOMAINS + _STATIC_DOMAINS
 
 
 def _is_noise(addr: str, noise=_NOISE_DOMAINS) -> bool:
     a = (addr or "").lower()
     return any(a == d or a.endswith("." + d) for d in noise)
+
+
+def _is_static_asset(addr: str, statics=_STATIC_DOMAINS) -> bool:
+    """是不是「大体积、无账号态、可直连」的静态资源域。"""
+    a = (addr or "").lower()
+    return any(a == d or a.endswith("." + d) for d in statics)
+
+
+def _dbg(msg: str):
+    if _DEBUG:
+        print(f"[fwd {time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
 def _parse_proxy(url: str) -> tuple:
@@ -200,14 +228,21 @@ class SocksForwarder:
 
     @classmethod
     async def start(cls, upstream_url: str, listen_host: str = "127.0.0.1",
-                    noise_domains=None, front: tuple | None = None) -> "SocksForwarder":
+                    noise_domains=None, front: tuple | None = None,
+                    direct_static: bool | None = None) -> "SocksForwarder":
         """noise_domains=None 用默认名单（dola 场景）；传 () 可覆盖（Google 目标必传 ()）。
 
         front：前置代理 (host, port, user, pass)。None 时按 环境变量 DOLA_PROXY_FRONT
         → 系统代理 自动探测；传 () 可显式禁用。
+
+        direct_static：静态资源域（_STATIC_DOMAINS）走本机直连，不占住宅流量。
+        默认 True —— 一次 SPA 首屏 3.42 MB 里几乎全是这类资源。
+        设 False 可回退「一切上行都过上游代理」的旧行为（只在静态域直连连不通时用）。
         """
         up_scheme, up_host, up_port, up_user, up_pass = _parse_proxy(upstream_url)
         noise = _NOISE_DOMAINS if noise_domains is None else tuple(noise_domains)
+        if direct_static is None:
+            direct_static = DIRECT_STATIC
         if front is None:
             env = os.environ.get("DOLA_PROXY_FRONT", "").strip()
             if env:
@@ -216,11 +251,11 @@ class SocksForwarder:
                 front = _auto_front()
         server = await asyncio.start_server(
             lambda r, w: _handle_client(r, w, up_scheme, up_host, up_port,
-                                        up_user, up_pass, noise, front),
+                                        up_user, up_pass, noise, front, direct_static),
             listen_host, 0)
         port = server.sockets[0].getsockname()[1]
-        _dbg("forwarder on %s:%d -> %s://%s:%d front=%s"
-             % (listen_host, port, up_scheme, up_host, up_port, front))
+        _dbg("forwarder on %s:%d -> %s://%s:%d front=%s direct_static=%s"
+             % (listen_host, port, up_scheme, up_host, up_port, front, direct_static))
         return cls(server, port, front)
 
     async def stop(self):
@@ -231,7 +266,8 @@ class SocksForwarder:
 async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                          up_scheme: str, up_host: str, up_port: int,
                          up_user, up_pass, noise=_NOISE_DOMAINS,
-                         front: tuple | None = None):
+                         front: tuple | None = None,
+                         allow_direct_static: bool = True):
     peer = writer.get_extra_info("peername")
     _dbg(f"client {peer} connected")
     try:
@@ -260,6 +296,23 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
         if _is_noise(addr, noise):
             _dbg(f"CONNECT {addr} = noise, reject fast")
             raise UpstreamAuthError(f"noise domain {addr}")
+
+        # ---- 静态资源直连（IPRocket 流量治理 · 2026-10-17）----
+        # 一次 SPA 首屏要拉 3.42 MB JS/CSS（chat.js 单文件 1.84 MB），而这些
+        # 静态域不带任何账号态。让它们走本机直连，等于把「每个浏览器任务」的
+        # 最大一笔流量直接从住宅账单上摘掉。转发出站不受影响（仍走隧道）。
+        if allow_direct_static and _is_static_asset(addr):
+            try:
+                dr, dw = await asyncio.open_connection(addr, port)
+            except OSError as exc:
+                raise UpstreamAuthError(
+                    f"static-直连失败 {addr}:{port}: {str(exc)[:80]}") from exc
+            _dbg(f"CONNECT {addr}:{port} = static, 本机直连（不耗住宅流量）")
+            writer.write(b"\x05\x00\x00\x01"
+                         + socket.inet_aton("0.0.0.0") + struct.pack(">H", 0))
+            await writer.drain()
+            await asyncio.gather(_pipe(reader, dw), _pipe(dr, writer))
+            return
 
         # ---- 上游握手（带账密；IPRocket/UDeal 等网关有拒连抖动且顶不住并发
         #      握手——全局串行化 + 自动重试。直连被按客户端 IP 拒（如 UDeal 602

@@ -47,19 +47,102 @@ POOL_DB_PATH = os.getenv("DOLA_POOL_DB_PATH", "pool_usage.db")
 # 视频下载目录（出片后下载转存，FastAPI 以静态文件方式对外提供）
 DOWNLOAD_DIR = os.getenv("DOLA_DOWNLOAD_DIR", "downloads")
 
-# 浏览器显式代理（P0 结论：不能依赖系统代理，Clash 规则变化会把 dola 分流到直连被墙）。
-# 必须是指向 JP/KR 出口的代理；留空 = 跟随系统代理（仅调试用）。
-PROXY = os.getenv("DOLA_PROXY", "http://127.0.0.1:7890")
+# ============================================================================
+# 【三段出口策略 · hint 830 / i831 落地】用户明确要求按用途分三段出口：
+#   ① 注册段  send_code / register_verify_login / login_check / 临时邮箱
+#             -> 本机 Clash HTTP 代理  http://127.0.0.1:7897   (REGISTER_PROXY 默认值)
+#                直连会被 1206 限流；127.0.0.1:7890 本机无监听 → ProxyError
+#                /「Max retries exceeded」，严禁使用。
+#   ② 提交段  POST /chat/completion(ability_type=17) + 窗口嗅探
+#             -> iprocket 住宅 socks5h（本机无 pysocks，走 i529/i728/i749 的裸 socket
+#                SOCKS5 shim；故 config.PROXY 置空=requests 层不加代理，由 shim 隧道
+#                www.dola.com）。iprocket 同池混好坏端点，CONNECT reply code=1 时换端点重试。
+#   ③ 下载段  get_play_info 的 CDN 直链(v16-dola.dola.com) -> 本地直连(proxy="")。
+# SUBMIT_EXIT 取值：residential(默认) | direct | http://host:port
+# 兼容旧行为时把 DOLA_SUBMIT_EXIT 设成旧 PROXY 值即可回退到单一出口。
+# ============================================================================
 
-# 注册专用代理（register_service）：注册只需要非大陆出口，与出片的 JP/KR 要求解耦。
-# 留空 = 回落 PROXY。合体项目默认走本机 Clash 混合端口（HK 出口，注册实测 100% 成功）。
-REGISTER_PROXY = os.getenv("DOLA_REGISTER_PROXY", "")
+# 浏览器显式代理（P0 结论：不能依赖系统代理，Clash 规则变化会把 dola 分流到直连被墙）。
+# 【2026-10-15 修正】旧默认 http://127.0.0.1:7890 本机无监听，是「chat/completion request
+# failed after 4 attempts: Max retries exceeded」「发码失败 [None]」的根因；改为三段策略下
+# 提交段默认走住宅 socks5h，此处留空表示 requests 层不加代理（由 three_segment_exit 的
+# 裸 socket SOCKS5 shim 隧道 www.dola.com）。
+PROXY = os.getenv("DOLA_PROXY", "")
+
+# 注册专用代理（register_service）：注册只需要非大陆出口，与出片的住宅要求解耦。
+# 【2026-10-15 修正】默认改为本机 Clash 7897（已实测通；旧空值+直连会被 1206 限流）。
+REGISTER_PROXY = os.getenv("DOLA_REGISTER_PROXY", "http://127.0.0.1:7897")
+
+# 提交段出口策略（三段策略的中间段）：residential=iprocket 住宅 socks5h(默认)；
+# direct=直连（仅调试）；http(s)://host:port=显式 http 代理（回退/对照）。
+SUBMIT_EXIT = os.getenv("DOLA_SUBMIT_EXIT", "residential")
+
+# 提交段经住宅出口时被隧道的 host 白名单（只有这些走住宅；CDN 等其它 host 自动直连）。
+# 保持 CDN(v16-dola.dola.com) 不在列表内 = 下载段本地直连（hint 830 ③）。
+#
+# 【IPRocket 流量治理 · 2026-10-17】住宅隧道按 GB 计费，而 shim 的拦截粒度是
+# hostname：只要 host 在名单里，那个 host 上的**一切**（API + 任何大对象）都会走
+# 住宅隧道，proxies={"http": None} 也绕不开（shim 在 socket 层）。所以这份名单必须
+# 是**最小 API 白名单**，绝不能把下载/CDN 域名放进来。
+# 实测：出片轮询/提交都在 www.dola.com，成片直链在 CDN 子域，二者本就分离。
+SUBMIT_TUNNEL = [h.strip() for h in
+                 os.getenv("DOLA_SUBMIT_TUNNEL", "www.dola.com").split(",") if h.strip()]
+
+# 隧道**排除名单**（优先级高于 SUBMIT_TUNNEL）：即使主机被上面列进来，命中这里
+# 也强制走本机直连。用来兜住「CDN 恰好挂在 www.dola.com 上」的情况（例如 /video/
+# 播放中转、大图大文件），避免成片体积混进住宅流量。
+# 留空 = 关闭排除逻辑（回到纯 hostname 精确匹配的旧行为）。
+SUBMIT_TUNNEL_EXCLUDE = [h.strip() for h in
+                         os.getenv("DOLA_SUBMIT_TUNNEL_EXCLUDE",
+                                   "v16-dola.dola.com,v26-vdl.dola.com").split(",")
+                         if h.strip()]
+# ★ 必须回写环境变量：three_segment_exit.apply() 是从 os.environ 读这份名单的
+#   （协议侧的 shim 不 import config）。不回写的话上面这个默认值形同虚设 ——
+#   排除逻辑永远不会生效，CDN 大对象照旧走住宅隧道。
+os.environ.setdefault("DOLA_SUBMIT_TUNNEL_EXCLUDE", ",".join(SUBMIT_TUNNEL_EXCLUDE))
 
 # 视频文件下载走本地直连（2026-10-07）：成片/分段下载是最大流量项，不再消耗
 # IPRocket 代理流量；Dola CDN（Akamai）直连可下载（纯 API 主路径一直是直连）。
 # 设 DOLA_DOWNLOAD_DIRECT=0 可恢复「下载走账号代理」的旧行为。
 DOWNLOAD_DIRECT = os.getenv("DOLA_DOWNLOAD_DIRECT", "1") not in ("0", "false", "False")
 
+# ============================================================================
+# 【IPRocket 流量治理 · 2026-10-17】—— 下面四个开关都只影响「走多少字节」，
+# 不改变任何出片协议语义。实测数据（.venv 直连 Clash 测线上 gzip 字节）：
+#   GET  /chat/create-image     77.2 KB   只为拿 ttwid（HEAD 0 字节等价）
+#   POST /alice/user/launch     47.5 KB   纯拉活，A/B 3:3 可省
+#   POST /im/chain/single        3.85 KB  单次轮询
+#   POST /chat/completion          19 KB  提交（嗅探器 6s 一发）
+# ============================================================================
+
+# ① 会话预热改用 HEAD（0 字节）而不是 GET 整个 SPA（压缩后 77 KB）。
+#    warmup_login_session 的唯一目的是让上游种下 ttwid / hook_slardar_session_id，
+#    HEAD 同样会收到 Set-Cookie。实测（_diag_headwarm.py）：HEAD 与 GET 后
+#    x-tt-agw-login 都是 '1'，anon/launch/链路查询全部正常。
+#    设 0 可回退成 GET 全量（只在怀疑上游对 HEAD 有额外校验时用）。
+WARMUP_HEAD = os.getenv("DOLA_WARMUP_HEAD", "1") == "1"
+
+# ② 建 session 时跳过 /alice/user/launch（每个号省 47.5 KB）。
+#    实测（_diag_launch2.py，各 3 轮）：带 launch 与省 launch 的
+#    x-tt-agw-login 均为 '1'、最近会话都是 6 条、/im/chain/single 查询全通。
+#    设 0 恢复「建 session 必打 launch」（怀疑上游改了拉活时序时用）。
+SKIP_LAUNCH = os.getenv("DOLA_SKIP_LAUNCH", "1") == "1"
+
+# ③ 出片轮询间隔（秒）。这是单任务流量的**主导项**：
+#    3.85 KB/次 × (等待时长/间隔)。
+#    30s 默认值时：等 60min = 120 次 ≈ 0.45 MB；等 120min ≈ 0.90 MB。
+#    改成 120s：等 60min = 30 次 ≈ 0.11 MB（省 76%）。
+#    上游出片常在分钟级到小时级，120s 的探测精度对「拿到成片」没有实质影响，
+#    只是晚 1~2 分钟发现。设回 30 可恢复旧行为。
+POLL_INTERVAL = int(os.getenv("DOLA_PURE_POLL_INTERVAL", "120"))
+
+# ④ 窗口嗅探器周期（秒）。实测 logs/dola_window.jsonl：
+#    8237 次 submit / 18.3h、中位间隔 6.0s → 每次提交约 19 KB，
+#    6s 周期 = 约 11 MB/h，一天 260 MB **全部花在「反复确认窗口关着」上**。
+#    710022002 是上游全局窗口（15~23 窗/h、每窗 2~12s），60s 周期仍能
+#    每小时命中十几次窗口；配合 worker 自己撞到 710 时 note_closed()，
+#    漏窗概率极低。设回 6 恢复旧行为。
+WINDOW_SNIFF_PERIOD_SEC = float(os.getenv("DOLA_WINDOW_SNIFF_PERIOD_SEC", "60"))
 # 浏览器是否无头运行（login.py 永远有头）
 HEADLESS = os.getenv("DOLA_HEADLESS", "1") == "1"
 
@@ -187,6 +270,27 @@ REFERENCE_THUMB_QUALITY = int(os.getenv("DOLA_REFERENCE_THUMB_QUALITY", "80"))
 REFERENCE_TOTAL_MAX_BYTES = int(
     os.getenv("DOLA_REFERENCE_TOTAL_MAX_BYTES", str(60 * 1024 * 1024))
 )
+# ===== 素材库（创作台 · 参考素材库 + 生成产物入库）=====
+# 为什么要独立目录：REFERENCE_FILE_DIR（refs/）里的文件是**临时物化产物**，
+# 任务终态会被 cleanup_local_references 删除、服务启动会被 sweep_stale_references
+# 清掉 24h 以上的文件。素材是用户的长期资产，必须放在**永不自动删**的目录里。
+# 详见 media.is_asset_reference() 与方案文档 §3.1。
+ASSET_DIR = os.getenv("DOLA_ASSET_DIR", "assets")
+ASSET_DB_PATH = os.getenv("DOLA_ASSET_DB_PATH", "assets.db")
+# 预览图：统一 512px（不能复用 REFERENCE_THUMB_* —— 那套只存 1 张、160px）
+ASSET_THUMB_DIR = os.getenv("DOLA_ASSET_THUMB_DIR", os.path.join(ASSET_DIR, ".thumbs"))
+ASSET_THUMB_MAX_PX = int(os.getenv("DOLA_ASSET_THUMB_MAX_PX", "512"))
+ASSET_THUMB_QUALITY = int(os.getenv("DOLA_ASSET_THUMB_QUALITY", "82"))
+# 上传校验：与 media._ALLOWED_IMAGE_FORMATS / server._save_uploaded_image 对齐
+ASSET_UPLOAD_MAX_BYTES = int(
+    os.getenv("DOLA_ASSET_UPLOAD_MAX_BYTES", str(15 * 1024 * 1024))
+)
+ASSET_UPLOAD_MAX_COUNT = int(os.getenv("DOLA_ASSET_UPLOAD_MAX_COUNT", "30"))
+# 素材总量上限：超限**拒绝新上传并提示**，绝不自动删用户素材
+ASSET_MAX_BYTES = int(os.getenv("DOLA_ASSET_MAX_BYTES", str(2 * 1024 * 1024 * 1024)))
+# 按内容 sha256 去重（同一张图重复上传只占一份）
+ASSET_DEDUP = os.getenv("DOLA_ASSET_DEDUP", "1") == "1"
+
 # 单条 prompt 上限（超出直接 422；store 里还有一层截断兜底）
 MAX_PROMPT_CHARS = int(os.getenv("DOLA_MAX_PROMPT_CHARS", "20000"))
 # 已结束任务的保留天数：超期自动删记录 + 删对应视频文件（0 = 不清理）
@@ -247,6 +351,28 @@ HELLO_PROBE_SUBMIT_GAP_SECONDS = int(os.getenv("DOLA_HELLO_PROBE_SUBMIT_GAP_SECO
 # 同一号两次向上游提交的最小间隔（秒）；0 = 不限制。
 MIN_SUBMIT_INTERVAL_SECONDS = int(os.getenv("DOLA_MIN_SUBMIT_INTERVAL_SECONDS", "0"))
 
+# ===== 窗口嗅探 + 整池爆发（2026-10-15，goal 612 渠道改造）=====
+# 核心事实：710022002「目前服務使用量過大」不是「封禁/换号可解」的瞬时限流，而是
+# 【单一全局网关周期性开窗】——实测 ≈15~23 窗口/h、每次约 2~12s，窗口开时整池同刻放行。
+# 因此 710022002 的正确处置是【交回全局窗口嗅探器排队】，而不是换号重试。
+# 1 = 启用窗口嗅探引擎（dola_window.py）；0 = 退回旧的「撞 710 换号重试」行为。
+WINDOW_SNIFF_ENABLED = os.getenv("DOLA_WINDOW_SNIFF", "1") == "1"
+# 哨兵探测周期（秒）：一个探针号按此周期打一发 /chat/completion 探全局闸门。
+# 真源在文件上方「IPRocket 流量治理」段的 WINDOW_SNIFF_PERIOD_SEC（默认 60s）。
+WINDOW_SNIFF_PERIOD_SEC = WINDOW_SNIFF_PERIOD_SEC
+# 窗口命中后，整池爆发提交的最大并发（同时对多少个号发 POST /chat/completion）。
+WINDOW_BURST_CONCURRENCY = int(os.getenv("DOLA_WINDOW_BURST_CONCURRENCY", "32"))
+# 参与爆发的准入配额阈值：当日剩余额度 >= 该值的号才进池（避免耗尽号的无效空打）。
+WINDOW_QUOTA_THRESHOLD = int(os.getenv("DOLA_WINDOW_QUOTA_THRESHOLD", "1"))
+# 单任务「等窗口 + 提交」的整体时限（秒）：超时仍没命中窗口则如实返回 WINDOW_CLOSED。
+WINDOW_WAIT_DEADLINE_SEC = int(os.getenv("DOLA_WINDOW_WAIT_DEADLINE_SEC", "1800"))
+# 单次窗口提交的网络超时（秒）。
+WINDOW_SUBMIT_TIMEOUT_SEC = int(os.getenv("DOLA_WINDOW_SUBMIT_TIMEOUT_SEC", "60"))
+# 窗口引擎的事实记录（jsonl）路径；留空 = 写 <workdir>/logs/dola_window.jsonl。
+WINDOW_REPORT_PATH = os.getenv("DOLA_WINDOW_REPORT_PATH", "")
+# 改造后 710022002 不再进 TRANSIENT_THROTTLE_MARKERS 的「换号重试」，而交回窗口嗅探器。
+WINDOW_TAKEOVER_710 = os.getenv("DOLA_WINDOW_TAKEOVER_710", "1") == "1"
+
 # 账号级测试生成（test_generate）遇上游瞬时限流（710022002「当前服务访问频繁」）的重试。
 # 号池路径遇 transient 换号重试；测试生成钉死指定账号，只能原地等待后重交。
 # RETRIES=0 恢复旧行为（一次被拒即任务失败）。
@@ -287,4 +413,28 @@ PURE_API_30S_TIMEOUT = int(os.getenv("DOLA_30S_TIMEOUT", "9000"))
 # 30 秒任务的任务级总时限（含换号）：单次窗口最长 PURE_API_30S_TIMEOUT，
 # 外加 30 分钟给「快速失败换号」用。3600s 的通用总时限会在上游 2h 排队下腰斩任务。
 TASK_DEADLINE_30S = int(os.getenv("DOLA_30S_TASK_DEADLINE", str(PURE_API_30S_TIMEOUT + 1800)))
-PURE_API_POLL_INTERVAL = int(os.getenv("DOLA_PURE_POLL_INTERVAL", "30"))
+# 真源在文件上方「IPRocket 流量治理」段的 POLL_INTERVAL（默认 120s，30s 时代
+# 单任务轮询流量是现在 4 倍）。
+PURE_API_POLL_INTERVAL = POLL_INTERVAL
+
+# ===== 三段出口策略落地（hint 830 / i831）=========================
+# ①注册走 Clash 7897 ②提交段由 DOLA_SUBMIT_EXIT 决定（residential=iprocket 住宅
+# socks5h 裸 socket shim；clash/direct/http://host:port=走 http 代理或直连）
+# ③下载 CDN 直链本地直连。
+# ★ 注意：这里传的是 apply(None)（config=None），所以 apply() 里所有
+#   `config.PROXY = ...` 的赋值都不会生效 —— config.PROXY 早已在第 70 行由
+#   DOLA_PROXY 决定。因此「切 Clash 出片」必须靠 .env.local 里的
+#   `DOLA_SUBMIT_EXIT=clash` + `DOLA_PROXY=http://127.0.0.1:7897` 两者配合。
+try:
+    import os as _os831, sys as _sys831
+    _sys831.path.insert(0, _os831.path.dirname(_os831.path.abspath(__file__)))
+    import three_segment_exit as _TS831
+    # 把 clash 别名解析成规范值（会同时补上 DOLA_PROXY），再让 PROXY 跟随它 ——
+    # 这样面板(server.py)与引擎(run_pool.py)两条路径都拿到同一个出口。
+    if _TS831.is_clash_alias(_TS831.SUBMIT_EXIT):
+        _os831.environ.setdefault("DOLA_PROXY", _TS831.CLASH_PROXY)
+        PROXY = _os831.environ["DOLA_PROXY"]
+    THREE_SEGMENT = _TS831.apply(None)
+    _TS831.start_keeper()
+except Exception as _e831:      # 传输层不可用时不阻断引擎（退回旧单出口行为）
+    THREE_SEGMENT = {"err": repr(_e831)}

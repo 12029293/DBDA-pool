@@ -56,6 +56,27 @@ _ACCOUNT = contextvars.ContextVar("dola_signer_account", default="shared")
 _circuit_until = 0.0
 _fail_log_at = 0.0
 
+# --------------------------------------------------------------------------
+# 控制台窗口抑制（hint855 根因）
+#
+# CREATE_NO_WINDOW 是"不要给我新窗口"，但当**父进程本身已有控制台**时该标志会被
+# 忽略 —— 于是每次起 node 长驻签名进程都会弹出一个黑窗（40+ 进程 = 40+ 弹窗）。
+# DETACHED_PROCESS 让子进程彻底不继承/不分配控制台，无论父进程有没有控制台，
+# 都不会出现 ConsoleWindowClass 窗口。两者必须同时加。
+# 实测（i860）：父进程无控制台 + flags=0 → 1 个 VISIBLE node 控制台窗；
+#              父进程有控制台 + CREATE_NO_WINDOW → 仍出现 VISIBLE 窗口；
+#              DETACHED_PROCESS|CREATE_NO_WINDOW → 0 个窗口。
+# --------------------------------------------------------------------------
+def spawn_flags() -> int:
+    """所有拉起 node/python 子进程的地方统一使用：DETACHED_PROCESS | CREATE_NO_WINDOW。"""
+    if os.name != "nt":
+        return 0
+    return (getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
+
+
+
+
 
 class _NoopTimer:
     def __enter__(self):
@@ -135,9 +156,15 @@ class PersistentSigner:
     def _start(self) -> None:
         env = os.environ.copy()
         env["DOLA_SIGNER_DAEMON"] = "1"
+        # 让守护进程能自己发现"父进程已死"并退出，避免残留无主孤儿（hint855 第 3 条）
+        env["DOLA_SIGNER_PARENT_PID"] = str(os.getpid())
         self._queue = queue.Queue()
         self._stderr_tail.clear()
         self._generation += 1
+        # 双击 .bat / 从资源管理器启动时，每个 node 长驻签名进程会弹出一个控制台黑窗
+        # （40+ 进程 = 40+ 弹窗）。CREATE_NO_WINDOW 在父进程已有控制台时会被忽略，
+        # 故必须再叠加 DETACHED_PROCESS 才能真正消除窗口（见 spawn_flags 说明）。
+        _creationflags = spawn_flags()
         self._proc = subprocess.Popen(
             [resolve_node(), str(self.script), "--daemon"],
             stdin=subprocess.PIPE,
@@ -149,6 +176,7 @@ class PersistentSigner:
             errors="replace",
             bufsize=1,
             env=env,
+            creationflags=_creationflags,
         )
         threading.Thread(target=self._read_stdout,
                          args=(self._proc, self._queue, self._generation),
@@ -354,6 +382,7 @@ class PersistentSigner:
             cwd=str(self.script.parent),
             encoding="utf-8",
             errors="replace",
+            creationflags=spawn_flags(),   # 一次性兜底 node 同样不得弹控制台窗
         )
         if proc.returncode != 0:
             raise RuntimeError(
@@ -496,6 +525,44 @@ class SignerPool:
 
 _SIGNER: SignerPool | None = None
 _SIGNER_LOCK = threading.Lock()
+_ATEXIT_HOOKED = False
+
+
+def _install_atexit_reaper() -> None:
+    """进程退出（含任务终态）时收掉自己拉起的 node 守护进程，不留可见控制台窗。"""
+    global _ATEXIT_HOOKED
+    if _ATEXIT_HOOKED:
+        return
+    _ATEXIT_HOOKED = True
+
+    def _reap() -> None:
+        global _SIGNER
+        pool = _SIGNER
+        if pool is not None:
+            try:
+                pool.close()
+            except Exception:
+                pass
+
+    try:
+        import atexit
+        atexit.register(_reap)
+    except Exception:
+        pass
+    try:
+        import signal
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            prev = signal.getsignal(sig)
+
+            def _handler(signum, frame, _prev=prev):
+                _reap()
+                if callable(_prev):
+                    return _prev(signum, frame)
+                raise SystemExit(128 + signum)
+
+            signal.signal(sig, _handler)
+    except Exception:
+        pass
 
 
 def get_signer() -> SignerPool:
@@ -503,6 +570,7 @@ def get_signer() -> SignerPool:
     with _SIGNER_LOCK:
         if _SIGNER is None:
             _SIGNER = SignerPool(signer_script())
+            _install_atexit_reaper()
             log.info("BDMS 签名进程池已就绪：%d 个进程", _SIGNER.size)
         return _SIGNER
 
